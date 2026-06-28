@@ -77,7 +77,7 @@ jobs:
           echo "BRANCH_NAME=cutting_release_branch/1_latest_cleanup_$GITHUB_RUN_ID" >> $GITHUB_OUTPUT
 
       - name: "Checkout ${{ github.repository }}"
-        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # actions/checkout@v4
         with:
           ref: "1.latest"
           token: ${{ secrets.FISHTOWN_BOT_PAT }}
@@ -105,7 +105,7 @@ jobs:
 
     steps:
       - name: "Checkout ${{ github.repository }}"
-        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # actions/checkout@v4
         with:
           ref: ${{ needs.create_temp_branch.outputs.temp_branch_name }}
           token: ${{ secrets.FISHTOWN_BOT_PAT }}
@@ -182,7 +182,7 @@ jobs:
 
     steps:
       - name: "Checkout ${{ github.repository }}"
-        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # actions/checkout@v4
         with:
           ref: ${{ needs.create_temp_branch.outputs.temp_branch_name }}
           token: ${{ secrets.FISHTOWN_BOT_PAT }}
@@ -230,7 +230,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: "Checkout ${{ github.repository }}"
-        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # actions/checkout@v4
         with:
           ref: ${{ needs.create_temp_branch.outputs.temp_branch_name }}
           token: ${{ secrets.FISHTOWN_BOT_PAT }}
@@ -275,7 +275,7 @@ jobs:
 
     steps:
       - name: "Checkout ${{ github.repository }}"
-        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # actions/checkout@v4
         with:
           ref: ${{ needs.create_temp_branch.outputs.temp_branch_name }}
           token: ${{ secrets.FISHTOWN_BOT_PAT }}
@@ -326,7 +326,7 @@ jobs:
 
     steps:
       - name: "Checkout ${{ github.repository }}"
-        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # actions/checkout@v4
         with:
           # Cut the new release branch from 1.latest (Python). Without this the
           # checkout defaults to the dispatched ref, which is main (Rust) by default
