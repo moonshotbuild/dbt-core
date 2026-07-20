@@ -1,0 +1,12 @@
+kind: Security
+body: Fix arbitrary file write during `dbt deps`. A malicious package archive could
+    use symlink or hard-link entries to escape `dbt_packages` and write or overwrite
+    files at an attacker-chosen path as the dbt user. Archive extraction now restricts
+    entries to regular files and directories, contains every entry within the extraction
+    root, and caps entry count and uncompressed size. The same hardening is applied
+    to the self-update path.
+time: 2026-07-20T23:21:30.913409+08:00
+custom:
+    author: joshuataylor
+    issue: ""
+    project: dbt-core
