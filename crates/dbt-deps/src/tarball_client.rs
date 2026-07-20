@@ -14,7 +14,7 @@ use reqwest_middleware::ClientWithMiddleware;
 use std::io;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncBufRead;
-use tokio_tar::Archive;
+use tokio_tar::ArchiveBuilder;
 use tokio_util::io::StreamReader;
 
 /// Client for downloading and extracting tarball archives.
@@ -110,7 +110,14 @@ where
     R: AsyncBufRead + Unpin + Send,
 {
     let decoder = GzipDecoder::new(reader);
-    let mut archive = Archive::new(decoder);
+    // Package archives are untrusted input. Keep `preserve_permissions` at its
+    // default (false) so an archive cannot set setuid/setgid or the exec bit,
+    // and disable overwrite: extraction always targets a freshly created
+    // directory, so no entry legitimately needs to clobber another.
+    let mut archive = ArchiveBuilder::new(decoder)
+        .set_allow_external_symlinks(false)
+        .set_overwrite(false)
+        .build();
 
     let mut entries = archive
         .entries()
@@ -130,6 +137,14 @@ where
             .path()
             .map_err(|e| fs_err!(ErrorCode::IoError, "Failed to get entry path: {}", e))?
             .into_owned();
+
+        // Tar metadata headers carry no payload of their own. GNU longname /
+        // longlink and local pax extensions are consumed inside the crate, but
+        // a global pax header is still yielded here (GitHub archives ship one).
+        let kind = entry.header().entry_type();
+        if kind.is_pax_global_extensions() || kind.is_gnu_longname() || kind.is_gnu_longlink() {
+            continue;
+        }
 
         // Determine/validate root directory
         if strip_root {
@@ -195,6 +210,22 @@ where
         // Skip empty paths (the prefix directory entry itself)
         if relative_path.as_os_str().is_empty() {
             continue;
+        }
+
+        // Security: a dbt package contains only regular files and directories.
+        // Symlinks, hard links and device/FIFO nodes never appear in a
+        // legitimate package, and allowing them re-opens link-based traversal:
+        // the crate's plain `unpack()` applies no containment to link targets,
+        // so a hard link can point at any existing absolute path regardless of
+        // `allow_external_symlinks`. Rejecting the whole class here closes it
+        // independently of the crate version.
+        if !(kind.is_file() || kind.is_dir()) {
+            return err!(
+                ErrorCode::InvalidConfig,
+                "Refusing to extract non-regular tar entry ({:?}): {}",
+                kind,
+                entry_path.display()
+            );
         }
 
         let target_entry_path = target_path.join(relative_path);
