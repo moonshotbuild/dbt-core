@@ -13,6 +13,7 @@ use reqwest::StatusCode;
 use reqwest_middleware::ClientWithMiddleware;
 use std::io;
 use std::path::{Path, PathBuf};
+use tokio::io::AsyncBufRead;
 use tokio_tar::Archive;
 use tokio_util::io::StreamReader;
 
@@ -80,145 +81,171 @@ impl TarballClient {
             result.map_err(|e| io::Error::other(format!("Failed to read stream: {}", e)))
         });
 
-        let reader = StreamReader::new(stream);
-        let decoder = GzipDecoder::new(reader);
-        let mut archive = Archive::new(decoder);
-
-        let mut entries = archive
-            .entries()
-            .map_err(|e| fs_err!(ErrorCode::IoError, "Failed to read tar entries: {}", e))?;
-
-        let mut root_dir: Option<String> = None;
-        let mut prefix = PathBuf::new();
-        let mut extracted_any = false;
-
-        while let Some(entry_result) = entries.next().await {
-            self.cancellation.check_cancellation()?;
-
-            let mut entry = entry_result
-                .map_err(|e| fs_err!(ErrorCode::IoError, "Failed to read tar entry: {}", e))?;
-
-            let entry_path: PathBuf = entry
-                .path()
-                .map_err(|e| fs_err!(ErrorCode::IoError, "Failed to get entry path: {}", e))?
-                .into_owned();
-
-            // Determine/validate root directory
-            if strip_root {
-                // Skip special entries like pax_global_header and macOS resource forks
-                let path_str = entry_path.to_string_lossy();
-                if path_str == "pax_global_header" || path_str.starts_with("._") {
-                    continue;
-                }
-
-                let first = entry_path
-                    .components()
-                    .next()
-                    .and_then(|c| match c {
-                        std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
-                        _ => None,
-                    })
-                    .ok_or_else(|| {
-                        fs_err!(
-                            ErrorCode::InvalidConfig,
-                            "Invalid tar entry path: {}",
-                            entry_path.display()
-                        )
-                    })?;
-
-                match &root_dir {
-                    None => {
-                        // Compute prefix once when root is discovered
-                        prefix = match subdirectory {
-                            Some(subdir) => PathBuf::from(&first).join(subdir),
-                            None => PathBuf::from(&first),
-                        };
-                        root_dir = Some(first);
-                    }
-                    Some(existing_root) => {
-                        if *existing_root != first {
-                            return err!(
-                                ErrorCode::InvalidConfig,
-                                "Tarball has multiple root directories: '{}' and '{}'. Expected single root directory.",
-                                existing_root,
-                                first
-                            );
-                        }
-                    }
-                }
-            } else if root_dir.is_none() && subdirectory.is_some() {
-                // For non-strip-root with subdirectory, compute prefix once
-                root_dir = Some(String::new()); // sentinel to avoid re-entering
-                prefix = PathBuf::from(subdirectory.unwrap());
-            }
-
-            // Filter: skip entries outside the prefix
-            if !prefix.as_os_str().is_empty() && !entry_path.starts_with(&prefix) {
-                continue;
-            }
-
-            // Strip prefix to get relative path
-            let relative_path: &Path = if !prefix.as_os_str().is_empty() {
-                entry_path.strip_prefix(&prefix).unwrap_or(&entry_path)
-            } else {
-                &entry_path
-            };
-
-            // Skip empty paths (the prefix directory entry itself)
-            if relative_path.as_os_str().is_empty() {
-                continue;
-            }
-
-            let target_entry_path = target_path.join(relative_path);
-
-            // Security: reject paths that escape the target directory (e.g. via ".." components)
-            if target_entry_path
-                .components()
-                .any(|c| c == std::path::Component::ParentDir)
-            {
-                return err!(
-                    ErrorCode::InvalidConfig,
-                    "Refusing to extract tar entry with path traversal: {}",
-                    entry_path.display()
-                );
-            }
-
-            entry.unpack(&target_entry_path).await.map_err(|e| {
-                fs_err!(
-                    ErrorCode::IoError,
-                    "Failed to unpack entry {}: {}",
-                    entry_path.display(),
-                    e
-                )
-            })?;
-
-            extracted_any = true;
-        }
-
-        // Validate that we extracted something
-        if !extracted_any {
-            if let Some(subdir) = subdirectory {
-                return err!(
-                    ErrorCode::InvalidConfig,
-                    "No entries found matching subdirectory '{}' in tarball from {}",
-                    subdir,
-                    download_url
-                );
-            } else if strip_root {
-                return err!(
-                    ErrorCode::InvalidConfig,
-                    "No root directory found in tarball from {}",
-                    download_url
-                );
-            } else {
-                return err!(
-                    ErrorCode::InvalidConfig,
-                    "No entries found in tarball from {}",
-                    download_url
-                );
-            }
-        }
-
-        Ok(target_path.to_path_buf())
+        extract_tar_gz(
+            StreamReader::new(stream),
+            download_url,
+            target_path,
+            strip_root,
+            subdirectory,
+            &self.cancellation,
+        )
+        .await
     }
+}
+
+/// Extract a gzipped tar stream into `target_path`.
+///
+/// Split out from [`TarballClient::download_and_extract_tarball`] so extraction
+/// can be exercised against in-memory archives without standing up HTTP.
+/// `source` names the archive's origin, and is used only in error messages.
+async fn extract_tar_gz<R>(
+    reader: R,
+    source: &str,
+    target_path: &Path,
+    strip_root: bool,
+    subdirectory: Option<&str>,
+    cancellation: &CancellationToken,
+) -> FsResult<PathBuf>
+where
+    R: AsyncBufRead + Unpin + Send,
+{
+    let decoder = GzipDecoder::new(reader);
+    let mut archive = Archive::new(decoder);
+
+    let mut entries = archive
+        .entries()
+        .map_err(|e| fs_err!(ErrorCode::IoError, "Failed to read tar entries: {}", e))?;
+
+    let mut root_dir: Option<String> = None;
+    let mut prefix = PathBuf::new();
+    let mut extracted_any = false;
+
+    while let Some(entry_result) = entries.next().await {
+        cancellation.check_cancellation()?;
+
+        let mut entry = entry_result
+            .map_err(|e| fs_err!(ErrorCode::IoError, "Failed to read tar entry: {}", e))?;
+
+        let entry_path: PathBuf = entry
+            .path()
+            .map_err(|e| fs_err!(ErrorCode::IoError, "Failed to get entry path: {}", e))?
+            .into_owned();
+
+        // Determine/validate root directory
+        if strip_root {
+            // Skip special entries like pax_global_header and macOS resource forks
+            let path_str = entry_path.to_string_lossy();
+            if path_str == "pax_global_header" || path_str.starts_with("._") {
+                continue;
+            }
+
+            let first = entry_path
+                .components()
+                .next()
+                .and_then(|c| match c {
+                    std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    fs_err!(
+                        ErrorCode::InvalidConfig,
+                        "Invalid tar entry path: {}",
+                        entry_path.display()
+                    )
+                })?;
+
+            match &root_dir {
+                None => {
+                    // Compute prefix once when root is discovered
+                    prefix = match subdirectory {
+                        Some(subdir) => PathBuf::from(&first).join(subdir),
+                        None => PathBuf::from(&first),
+                    };
+                    root_dir = Some(first);
+                }
+                Some(existing_root) => {
+                    if *existing_root != first {
+                        return err!(
+                            ErrorCode::InvalidConfig,
+                            "Tarball has multiple root directories: '{}' and '{}'. Expected single root directory.",
+                            existing_root,
+                            first
+                        );
+                    }
+                }
+            }
+        } else if root_dir.is_none() && subdirectory.is_some() {
+            // For non-strip-root with subdirectory, compute prefix once
+            root_dir = Some(String::new()); // sentinel to avoid re-entering
+            prefix = PathBuf::from(subdirectory.unwrap());
+        }
+
+        // Filter: skip entries outside the prefix
+        if !prefix.as_os_str().is_empty() && !entry_path.starts_with(&prefix) {
+            continue;
+        }
+
+        // Strip prefix to get relative path
+        let relative_path: &Path = if !prefix.as_os_str().is_empty() {
+            entry_path.strip_prefix(&prefix).unwrap_or(&entry_path)
+        } else {
+            &entry_path
+        };
+
+        // Skip empty paths (the prefix directory entry itself)
+        if relative_path.as_os_str().is_empty() {
+            continue;
+        }
+
+        let target_entry_path = target_path.join(relative_path);
+
+        // Security: reject paths that escape the target directory (e.g. via ".." components)
+        if target_entry_path
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+        {
+            return err!(
+                ErrorCode::InvalidConfig,
+                "Refusing to extract tar entry with path traversal: {}",
+                entry_path.display()
+            );
+        }
+
+        entry.unpack(&target_entry_path).await.map_err(|e| {
+            fs_err!(
+                ErrorCode::IoError,
+                "Failed to unpack entry {}: {}",
+                entry_path.display(),
+                e
+            )
+        })?;
+
+        extracted_any = true;
+    }
+
+    // Validate that we extracted something
+    if !extracted_any {
+        if let Some(subdir) = subdirectory {
+            return err!(
+                ErrorCode::InvalidConfig,
+                "No entries found matching subdirectory '{}' in tarball from {}",
+                subdir,
+                source
+            );
+        } else if strip_root {
+            return err!(
+                ErrorCode::InvalidConfig,
+                "No root directory found in tarball from {}",
+                source
+            );
+        } else {
+            return err!(
+                ErrorCode::InvalidConfig,
+                "No entries found in tarball from {}",
+                source
+            );
+        }
+    }
+
+    Ok(target_path.to_path_buf())
 }
