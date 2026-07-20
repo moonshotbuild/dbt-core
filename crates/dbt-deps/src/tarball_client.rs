@@ -12,7 +12,8 @@ use futures::StreamExt;
 use reqwest::StatusCode;
 use reqwest_middleware::ClientWithMiddleware;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use tokio::fs as tokiofs;
 use tokio::io::AsyncBufRead;
 use tokio_tar::ArchiveBuilder;
 use tokio_util::io::StreamReader;
@@ -119,6 +120,18 @@ where
         .set_overwrite(false)
         .build();
 
+    // Resolve the extraction root once so per-entry containment checks compare
+    // fully resolved paths (the root itself is often below a symlink, e.g.
+    // /var -> /private/var on macOS).
+    let canonical_root = tokiofs::canonicalize(target_path).await.map_err(|e| {
+        fs_err!(
+            ErrorCode::IoError,
+            "Failed to resolve extraction root {}: {}",
+            target_path.display(),
+            e
+        )
+    })?;
+
     let mut entries = archive
         .entries()
         .map_err(|e| fs_err!(ErrorCode::IoError, "Failed to read tar entries: {}", e))?;
@@ -158,7 +171,7 @@ where
                 .components()
                 .next()
                 .and_then(|c| match c {
-                    std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+                    Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
                     _ => None,
                 })
                 .ok_or_else(|| {
@@ -228,18 +241,53 @@ where
             );
         }
 
-        let target_entry_path = target_path.join(relative_path);
-
-        // Security: reject paths that escape the target directory (e.g. via ".." components)
-        if target_entry_path
+        // Security: reject anything but plain path components. This catches
+        // ".." traversal and absolute entry paths, which would otherwise escape
+        // the root entirely, since `Path::join` on an absolute path discards the
+        // base.
+        if relative_path
             .components()
-            .any(|c| c == std::path::Component::ParentDir)
+            .any(|c| !matches!(c, Component::Normal(_)))
         {
             return err!(
                 ErrorCode::InvalidConfig,
                 "Refusing to extract tar entry with path traversal: {}",
                 entry_path.display()
             );
+        }
+
+        let target_entry_path = target_path.join(relative_path);
+
+        // Defence in depth: resolve the entry's parent and confirm it is still
+        // inside the extraction root. Catches anything the component check
+        // misses, including a parent that resolves through a symlink.
+        if let Some(parent) = target_entry_path.parent() {
+            // Archives normally order directory entries before their children,
+            // but do not rely on it: create the parent inside the root so it can
+            // be resolved.
+            tokiofs::create_dir_all(parent).await.map_err(|e| {
+                fs_err!(
+                    ErrorCode::IoError,
+                    "Failed to create directory {}: {}",
+                    parent.display(),
+                    e
+                )
+            })?;
+            let canonical_parent = tokiofs::canonicalize(parent).await.map_err(|e| {
+                fs_err!(
+                    ErrorCode::IoError,
+                    "Failed to resolve directory {}: {}",
+                    parent.display(),
+                    e
+                )
+            })?;
+            if !canonical_parent.starts_with(&canonical_root) {
+                return err!(
+                    ErrorCode::InvalidConfig,
+                    "Refusing to extract tar entry that escapes the extraction root: {}",
+                    entry_path.display()
+                );
+            }
         }
 
         entry.unpack(&target_entry_path).await.map_err(|e| {
