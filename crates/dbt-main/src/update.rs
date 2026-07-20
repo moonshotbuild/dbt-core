@@ -316,6 +316,10 @@ pub async fn resolve_target_version(
 // Native update path (behind DBT_NATIVE_UPDATE=1)
 // ---------------------------------------------------------------------------
 
+/// Maximum accepted size of the binary inside the release archive.
+#[cfg(not(target_os = "windows"))]
+const MAX_BINARY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 /// Download the tarball, extract the binary, and install atomically.
 #[cfg(not(target_os = "windows"))]
 async fn download_and_install(
@@ -346,7 +350,13 @@ async fn download_and_install(
 
     let reader = tokio::io::BufReader::new(bytes.as_slice());
     let decoder = GzipDecoder::new(reader);
-    let mut archive = tokio_tar::Archive::new(decoder);
+    // Treat the release archive as untrusted: no link entries, no permission
+    // preservation (the binary's mode is set explicitly below), no overwrite.
+    let mut archive = tokio_tar::ArchiveBuilder::new(decoder)
+        .set_allow_external_symlinks(false)
+        .set_preserve_permissions(false)
+        .set_overwrite(false)
+        .build();
 
     let dest_binary = dest_dir.join(package);
     std::fs::create_dir_all(dest_dir).map_err(|e| {
@@ -393,6 +403,25 @@ async fn download_and_install(
 
         if file_name != package {
             continue;
+        }
+
+        // The binary must be a regular file. A symlink or hard link entry would
+        // otherwise read as empty and silently install a zero-byte binary.
+        let kind = entry.header().entry_type();
+        if !kind.is_file() {
+            return err!(
+                ErrorCode::IoError,
+                "Archive entry for '{package}' is not a regular file ({kind:?})"
+            );
+        }
+
+        // Bound the write so a malformed or hostile archive cannot fill the disk.
+        let entry_size = entry.header().size().unwrap_or(0);
+        if entry_size > MAX_BINARY_BYTES {
+            return err!(
+                ErrorCode::IoError,
+                "Archive entry for '{package}' exceeds the maximum size ({MAX_BINARY_BYTES} bytes)"
+            );
         }
 
         let mut tmp_writer = tokio::fs::File::create(tmp_file.path())
