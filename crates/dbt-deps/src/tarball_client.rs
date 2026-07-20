@@ -370,3 +370,266 @@ where
 
     Ok(target_path.to_path_buf())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dbt_common::cancellation::never_cancels;
+
+    const BLOCK: usize = 512;
+
+    // Typeflags, per the ustar spec.
+    const TYPE_FILE: u8 = b'0';
+    const TYPE_HARD_LINK: u8 = b'1';
+    const TYPE_SYMLINK: u8 = b'2';
+    const TYPE_CHAR_DEVICE: u8 = b'3';
+    const TYPE_FIFO: u8 = b'6';
+    const TYPE_DIR: u8 = b'5';
+
+    /// Build a ustar header block by hand. Going through the `tar` crate would
+    /// not do: it refuses to emit several of the entries these tests need.
+    fn header(name: &str, size: u64, typeflag: u8, linkname: &str) -> Vec<u8> {
+        let mut h = vec![0u8; BLOCK];
+
+        let write = |h: &mut Vec<u8>, at: usize, bytes: &[u8]| {
+            h[at..at + bytes.len()].copy_from_slice(bytes);
+        };
+        let octal = |value: u64, width: usize| format!("{:0>width$o}\0", value, width = width - 1);
+
+        write(&mut h, 0, name.as_bytes());
+        write(&mut h, 100, octal(0o644, 8).as_bytes());
+        write(&mut h, 108, octal(0, 8).as_bytes());
+        write(&mut h, 116, octal(0, 8).as_bytes());
+        write(&mut h, 124, octal(size, 12).as_bytes());
+        write(&mut h, 136, octal(0, 12).as_bytes());
+        h[156] = typeflag;
+        write(&mut h, 157, linkname.as_bytes());
+        write(&mut h, 257, b"ustar\0");
+        write(&mut h, 263, b"00");
+
+        // Checksum is computed with the checksum field itself read as spaces.
+        h[148..156].fill(b' ');
+        let sum: u64 = h.iter().map(|b| *b as u64).sum();
+        write(&mut h, 148, format!("{:06o}\0 ", sum).as_bytes());
+
+        h
+    }
+
+    fn entry(name: &str, typeflag: u8, linkname: &str, data: &[u8]) -> Vec<u8> {
+        let mut out = header(name, data.len() as u64, typeflag, linkname);
+        if !data.is_empty() {
+            out.extend_from_slice(data);
+            let pad = (BLOCK - data.len() % BLOCK) % BLOCK;
+            out.extend(std::iter::repeat_n(0u8, pad));
+        }
+        out
+    }
+
+    /// An entry declaring a size it does not carry -- for the size-cap tests,
+    /// which must reject before any data is read.
+    fn entry_declaring(name: &str, size: u64) -> Vec<u8> {
+        header(name, size, TYPE_FILE, "")
+    }
+
+    async fn gzip(tar: Vec<u8>) -> Vec<u8> {
+        use async_compression::tokio::write::GzipEncoder;
+        use tokio::io::AsyncWriteExt;
+
+        let mut encoder = GzipEncoder::new(Vec::new());
+        encoder.write_all(&tar).await.unwrap();
+        encoder.shutdown().await.unwrap();
+        encoder.into_inner()
+    }
+
+    /// Assemble the entries into a gzipped archive and extract it into a fresh
+    /// temp dir, returning that dir alongside the extraction result.
+    async fn extract(entries: Vec<Vec<u8>>) -> (tempfile::TempDir, FsResult<PathBuf>) {
+        let mut tar: Vec<u8> = entries.concat();
+        tar.extend(std::iter::repeat_n(0u8, BLOCK * 2)); // end-of-archive marker
+        let gz = gzip(tar).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let result = extract_tar_gz(
+            &gz[..],
+            "test://archive.tar.gz",
+            dir.path(),
+            true,
+            None,
+            &never_cancels(),
+        )
+        .await;
+        (dir, result)
+    }
+
+    fn project_entry() -> Vec<u8> {
+        entry("pkg/dbt_project.yml", TYPE_FILE, "", b"name: pkg\n")
+    }
+
+    #[tokio::test]
+    async fn extracts_a_well_formed_package() {
+        let (dir, result) = extract(vec![
+            entry("pkg/", TYPE_DIR, "", b""),
+            project_entry(),
+            entry("pkg/models/a.sql", TYPE_FILE, "", b"select 1\n"),
+        ])
+        .await;
+
+        assert!(result.is_ok(), "expected success, got {:?}", result.err());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("dbt_project.yml")).unwrap(),
+            "name: pkg\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("models/a.sql")).unwrap(),
+            "select 1\n"
+        );
+    }
+
+    /// The reported escape: a symlink out of the extraction root, then a file
+    /// written through it. Must be rejected, and the sentinel left untouched.
+    #[tokio::test]
+    async fn rejects_symlink_escape() {
+        let outside = tempfile::tempdir().unwrap();
+        let sentinel = outside.path().join("sentinel.txt");
+        std::fs::write(&sentinel, "ORIGINAL").unwrap();
+
+        let (dir, result) = extract(vec![
+            project_entry(),
+            entry(
+                "pkg/evil",
+                TYPE_SYMLINK,
+                outside.path().to_str().unwrap(),
+                b"",
+            ),
+            entry("pkg/evil/sentinel.txt", TYPE_FILE, "", b"OWNED"),
+        ])
+        .await;
+
+        assert_error_mentions(&result, "non-regular tar entry");
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "ORIGINAL");
+        assert!(!dir.path().join("evil").exists());
+    }
+
+    /// The symlink flag does not cover hard links: the crate's plain `unpack()`
+    /// applies no containment to a hard-link target, so this must be rejected on
+    /// entry type alone.
+    #[tokio::test]
+    async fn rejects_hard_link_escape() {
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "SECRET").unwrap();
+
+        let (dir, result) = extract(vec![
+            project_entry(),
+            entry("pkg/leak", TYPE_HARD_LINK, secret.to_str().unwrap(), b""),
+        ])
+        .await;
+
+        assert_error_mentions(&result, "non-regular tar entry");
+        assert!(!dir.path().join("leak").exists());
+    }
+
+    #[tokio::test]
+    async fn rejects_device_and_fifo_entries() {
+        for typeflag in [TYPE_CHAR_DEVICE, TYPE_FIFO] {
+            let (_dir, result) =
+                extract(vec![project_entry(), entry("pkg/node", typeflag, "", b"")]).await;
+            assert_error_mentions(&result, "non-regular tar entry");
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_parent_dir_traversal() {
+        let (_dir, result) = extract(vec![
+            project_entry(),
+            entry("pkg/../escape.txt", TYPE_FILE, "", b"OWNED"),
+        ])
+        .await;
+
+        assert_error_mentions(&result, "path traversal");
+    }
+
+    /// `Path::join` on an absolute path discards the base, so an absolute entry
+    /// path would write straight to that path if it were not rejected.
+    #[tokio::test]
+    async fn rejects_absolute_entry_path() {
+        let outside = tempfile::tempdir().unwrap();
+        let sentinel = outside.path().join("sentinel.txt");
+        std::fs::write(&sentinel, "ORIGINAL").unwrap();
+
+        // strip_root would reject a leading "/" before the path checks run, so
+        // exercise this with strip_root disabled.
+        let mut tar: Vec<u8> =
+            [entry(sentinel.to_str().unwrap(), TYPE_FILE, "", b"OWNED")].concat();
+        tar.extend(std::iter::repeat_n(0u8, BLOCK * 2));
+        let gz = gzip(tar).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let result = extract_tar_gz(
+            &gz[..],
+            "test://archive.tar.gz",
+            dir.path(),
+            false,
+            None,
+            &never_cancels(),
+        )
+        .await;
+
+        assert_error_mentions(&result, "path traversal");
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "ORIGINAL");
+    }
+
+    #[tokio::test]
+    async fn rejects_entry_over_the_size_cap() {
+        let (_dir, result) = extract(vec![
+            project_entry(),
+            entry_declaring("pkg/bomb.bin", MAX_ENTRY_BYTES + 1),
+        ])
+        .await;
+
+        assert_error_mentions(&result, "maximum entry size");
+    }
+
+    // The running-total cap (MAX_TOTAL_BYTES) is deliberately not unit tested:
+    // reaching it needs several entries that each sit under the per-entry cap, so
+    // the earlier ones must carry real data and actually unpack -- multiple GiB
+    // written to disk. It shares its accounting with the per-entry check above.
+
+    fn assert_error_mentions(result: &FsResult<PathBuf>, needle: &str) {
+        match result {
+            Ok(path) => panic!("expected rejection, but extraction succeeded at {path:?}"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains(needle),
+                    "expected error mentioning {needle:?}, got: {msg}"
+                );
+            }
+        }
+    }
+
+    /// Guards the assumption the containment check rests on: nothing is written
+    /// outside the extraction root even when the archive is rejected midway.
+    #[tokio::test]
+    async fn writes_nothing_outside_the_root_on_rejection() {
+        let outside = tempfile::tempdir().unwrap();
+        let before: Vec<_> = std::fs::read_dir(outside.path()).unwrap().collect();
+        assert!(before.is_empty());
+
+        let (_dir, result) = extract(vec![
+            project_entry(),
+            entry(
+                "pkg/evil",
+                TYPE_SYMLINK,
+                outside.path().to_str().unwrap(),
+                b"",
+            ),
+            entry("pkg/evil/planted.txt", TYPE_FILE, "", b"OWNED"),
+        ])
+        .await;
+
+        assert!(result.is_err());
+        let after: Vec<_> = std::fs::read_dir(outside.path()).unwrap().collect();
+        assert!(after.is_empty(), "files were written outside the root");
+    }
+}
