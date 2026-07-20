@@ -18,6 +18,13 @@ use tokio::io::AsyncBufRead;
 use tokio_tar::ArchiveBuilder;
 use tokio_util::io::StreamReader;
 
+/// Maximum number of entries accepted from a single archive.
+const MAX_ENTRIES: usize = 100_000;
+/// Maximum declared uncompressed size of a single entry.
+const MAX_ENTRY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Maximum declared uncompressed size of a whole archive.
+const MAX_TOTAL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
 /// Client for downloading and extracting tarball archives.
 #[derive(Clone)]
 pub struct TarballClient {
@@ -139,12 +146,47 @@ where
     let mut root_dir: Option<String> = None;
     let mut prefix = PathBuf::new();
     let mut extracted_any = false;
+    let mut entry_count: usize = 0;
+    let mut total_bytes: u64 = 0;
 
     while let Some(entry_result) = entries.next().await {
         cancellation.check_cancellation()?;
 
         let mut entry = entry_result
             .map_err(|e| fs_err!(ErrorCode::IoError, "Failed to read tar entry: {}", e))?;
+
+        // Bound resource consumption before doing any work with the entry. Tar
+        // is size-prefixed, so the declared header size is what gets written.
+        entry_count += 1;
+        if entry_count > MAX_ENTRIES {
+            return err!(
+                ErrorCode::InvalidConfig,
+                "Tarball from {} exceeds the maximum entry count ({})",
+                source,
+                MAX_ENTRIES
+            );
+        }
+        let entry_size = entry.header().size().unwrap_or(0);
+        if entry_size > MAX_ENTRY_BYTES {
+            return err!(
+                ErrorCode::InvalidConfig,
+                "Tar entry exceeds the maximum entry size ({} bytes): {}",
+                MAX_ENTRY_BYTES,
+                entry
+                    .path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            );
+        }
+        total_bytes = total_bytes.saturating_add(entry_size);
+        if total_bytes > MAX_TOTAL_BYTES {
+            return err!(
+                ErrorCode::InvalidConfig,
+                "Tarball from {} exceeds the maximum uncompressed size ({} bytes)",
+                source,
+                MAX_TOTAL_BYTES
+            );
+        }
 
         let entry_path: PathBuf = entry
             .path()
