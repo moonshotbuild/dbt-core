@@ -385,6 +385,7 @@ mod tests {
     const TYPE_CHAR_DEVICE: u8 = b'3';
     const TYPE_FIFO: u8 = b'6';
     const TYPE_DIR: u8 = b'5';
+    const TYPE_PAX_GLOBAL: u8 = b'g';
 
     /// Build a ustar header block by hand. Going through the `tar` crate would
     /// not do: it refuses to emit several of the entries these tests need.
@@ -431,6 +432,20 @@ mod tests {
         header(name, size, TYPE_FILE, "")
     }
 
+    /// A regular-file entry carrying an explicit mode, for asserting that
+    /// `preserve_permissions(false)` strips it. Overwrites the mode field
+    /// (`header` hardcodes 0o644) and rebuilds the checksum.
+    fn entry_with_mode(name: &str, mode: u32, data: &[u8]) -> Vec<u8> {
+        let mut out = entry(name, TYPE_FILE, "", data);
+        let octal = |value: u64, width: usize| format!("{:0>width$o}\0", value, width = width - 1);
+        out[100..108].copy_from_slice(octal(mode as u64, 8).as_bytes());
+        // Recompute the checksum with its own field read as spaces.
+        out[148..156].copy_from_slice(b"        ");
+        let sum: u64 = out[..BLOCK].iter().map(|b| *b as u64).sum();
+        out[148..156].copy_from_slice(format!("{:06o}\0 ", sum).as_bytes());
+        out
+    }
+
     async fn gzip(tar: Vec<u8>) -> Vec<u8> {
         use async_compression::tokio::write::GzipEncoder;
         use tokio::io::AsyncWriteExt;
@@ -459,6 +474,28 @@ mod tests {
         )
         .await;
         (dir, result)
+    }
+
+    /// Like [`extract`], but lets a test choose the extraction root, `strip_root`,
+    /// and `subdirectory` -- the branches the plain `extract` helper leaves fixed.
+    async fn extract_into(
+        entries: Vec<Vec<u8>>,
+        root: &Path,
+        strip_root: bool,
+        subdirectory: Option<&str>,
+    ) -> FsResult<PathBuf> {
+        let mut tar: Vec<u8> = entries.concat();
+        tar.extend(std::iter::repeat_n(0u8, BLOCK * 2)); // end-of-archive marker
+        let gz = gzip(tar).await;
+        extract_tar_gz(
+            &gz[..],
+            "test://archive.tar.gz",
+            root,
+            strip_root,
+            subdirectory,
+            &never_cancels(),
+        )
+        .await
     }
 
     fn project_entry() -> Vec<u8> {
@@ -631,5 +668,171 @@ mod tests {
         assert!(result.is_err());
         let after: Vec<_> = std::fs::read_dir(outside.path()).unwrap().collect();
         assert!(after.is_empty(), "files were written outside the root");
+    }
+
+    /// The extraction root itself sitting under a symlink is the case the
+    /// containment check canonicalizes for -- it mirrors `/var -> /private/var`
+    /// on macOS and symlinked `TMPDIR`s. A legitimate package must still install:
+    /// the resolved children are inside the resolved root, so nothing is flagged
+    /// as an escape.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn extracts_into_a_symlinked_root() {
+        let real = tempfile::tempdir().unwrap();
+        let target = real.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = real.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let result = extract_into(
+            vec![
+                project_entry(),
+                entry("pkg/models/a.sql", TYPE_FILE, "", b"select 1\n"),
+            ],
+            &link,
+            true,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok(), "expected success, got {:?}", result.err());
+        assert_eq!(
+            std::fs::read_to_string(target.join("models/a.sql")).unwrap(),
+            "select 1\n"
+        );
+    }
+
+    /// `subdirectory` selects a sub-tree of the package root and extracts it at
+    /// the destination root; everything outside it is skipped.
+    #[tokio::test]
+    async fn extracts_a_subdirectory() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = extract_into(
+            vec![
+                project_entry(),
+                entry("pkg/other/ignored.sql", TYPE_FILE, "", b"-- ignored\n"),
+                entry("pkg/sub/dbt_project.yml", TYPE_FILE, "", b"name: sub\n"),
+                entry("pkg/sub/models/b.sql", TYPE_FILE, "", b"select 2\n"),
+            ],
+            dir.path(),
+            true,
+            Some("sub"),
+        )
+        .await;
+
+        assert!(result.is_ok(), "expected success, got {:?}", result.err());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("dbt_project.yml")).unwrap(),
+            "name: sub\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("models/b.sql")).unwrap(),
+            "select 2\n"
+        );
+        assert!(!dir.path().join("other").exists());
+    }
+
+    /// `strip_root = false` keeps every entry at its archive path. Covers the
+    /// non-strip-root install path on the happy side (it is otherwise only seen
+    /// through the absolute-path rejection).
+    #[tokio::test]
+    async fn extracts_without_strip_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = extract_into(
+            vec![
+                entry("dbt_project.yml", TYPE_FILE, "", b"name: pkg\n"),
+                entry("models/a.sql", TYPE_FILE, "", b"select 1\n"),
+            ],
+            dir.path(),
+            false,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok(), "expected success, got {:?}", result.err());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("models/a.sql")).unwrap(),
+            "select 1\n"
+        );
+    }
+
+    /// A dbt package has a single root directory. Two distinct roots is a
+    /// malformed (or crafted) archive and is rejected.
+    #[tokio::test]
+    async fn rejects_multiple_root_directories() {
+        let (_dir, result) = extract(vec![
+            project_entry(),
+            entry("other/b.sql", TYPE_FILE, "", b"select 2\n"),
+        ])
+        .await;
+
+        assert_error_mentions(&result, "multiple root directories");
+    }
+
+    #[tokio::test]
+    async fn errors_on_empty_archive() {
+        let (_dir, result) = extract(vec![]).await;
+        assert_error_mentions(&result, "No root directory found");
+    }
+
+    #[tokio::test]
+    async fn errors_when_subdirectory_matches_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = extract_into(
+            vec![
+                project_entry(),
+                entry("pkg/models/a.sql", TYPE_FILE, "", b"select 1\n"),
+            ],
+            dir.path(),
+            true,
+            Some("nope"),
+        )
+        .await;
+
+        assert_error_mentions(&result, "No entries found matching subdirectory");
+    }
+
+    /// `preserve_permissions(false)`: an archive cannot smuggle setuid/setgid or
+    /// the exec bit onto extracted files.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn strips_setuid_and_exec_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, result) = extract(vec![
+            project_entry(),
+            entry_with_mode("pkg/tool.sh", 0o4777, b"#!/bin/sh\n"),
+        ])
+        .await;
+
+        assert!(result.is_ok(), "expected success, got {:?}", result.err());
+        let mode = std::fs::metadata(dir.path().join("tool.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o4000, 0, "setuid bit survived: {mode:o}");
+        assert_eq!(mode & 0o111, 0, "exec bits survived: {mode:o}");
+    }
+
+    /// GitHub source archives ship a pax global header; macOS `tar` adds a
+    /// top-level `pax_global_header` and `._`-prefixed AppleDouble entries. All
+    /// are skipped without derailing extraction of the real files.
+    #[tokio::test]
+    async fn skips_pax_global_and_resource_fork_entries() {
+        let (dir, result) = extract(vec![
+            // pax global extensions header, typeflag 'g' (real GitHub archives ship one).
+            entry("pax_global_header", TYPE_PAX_GLOBAL, "", b"17 comment=hello\n"),
+            project_entry(),
+            entry("._pkg", TYPE_FILE, "", b"apple-double\n"),
+            entry("pkg/models/a.sql", TYPE_FILE, "", b"select 1\n"),
+        ])
+        .await;
+
+        assert!(result.is_ok(), "expected success, got {:?}", result.err());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("models/a.sql")).unwrap(),
+            "select 1\n"
+        );
+        assert!(!dir.path().join("._pkg").exists());
     }
 }
