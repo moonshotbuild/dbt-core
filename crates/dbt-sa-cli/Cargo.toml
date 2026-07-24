@@ -24,9 +24,12 @@ default = ["embed-ui"]
 embed-ui = ["dbt-main/embed-ui"]
 
 [dev-dependencies]
+dbt-frontend-common = { workspace = true }
+dbt-schemas = { workspace = true }
 dbt-test-primitives = { workspace = true }
 dbt-test-utils = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
 
 [[bin]]
 doctest = false

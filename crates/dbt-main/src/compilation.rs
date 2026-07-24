@@ -384,6 +384,7 @@ impl<'a> CompilationPhasesExecutor<'a> {
             use_resolver_state_deps: false,
             no_version_check: self.cli.common_args.no_version_check,
             use_full_schema_store: false,
+            compiled_sql_cache: None,
         };
         match try_load_prev_compilation(
             &self.arg,
@@ -857,6 +858,18 @@ use crate::partial_parse::{
 use dbt_compilation::traits::{CompilationCache, CompiledProject};
 use dbt_state::selector::RunCacheStateSelectorArgs;
 
+/// Resolves the compiled-SQL cache for a `run_tasks` invocation.
+/// Priority: previous cache state's cache > config-supplied cache >
+/// disk-backed default (writes under the target directory).
+fn resolve_compiled_sql_cache(
+    previous: Option<Arc<dyn CompiledSqlCache>>,
+    configured: Option<Arc<dyn CompiledSqlCache>>,
+) -> Arc<dyn CompiledSqlCache> {
+    previous
+        .or(configured)
+        .unwrap_or_else(|| Arc::new(CompiledSqlCacheImpl::default()))
+}
+
 impl DbtProjectCompilation {
     fn dbt_state(&self) -> Arc<DbtState> {
         self.loaded_project.dbt_state()
@@ -1028,6 +1041,7 @@ impl DbtProjectCompilation {
             use_resolver_state_deps: false,
             no_version_check: cli.common_args.no_version_check,
             use_full_schema_store: false,
+            compiled_sql_cache: None,
         };
         DbtProjectCompilation::initialize(
             feature_stack,
@@ -1078,6 +1092,7 @@ impl DbtProjectCompilation {
             use_resolver_state_deps: false,
             no_version_check: cli.common_args.no_version_check,
             use_full_schema_store: false,
+            compiled_sql_cache: None,
         };
 
         let (mut maybe_prev, use_lazy_filter) = if cli.common_args.effective_partial_parse() {
@@ -1330,6 +1345,12 @@ impl DbtProjectCompilation {
 impl DbtProjectCompilation {
     /// Initializes a new compilation for use as a stateful server.
     /// The resulting compilation is based on the state of the file system.
+    ///
+    /// `compiled_sql_cache` optionally supplies a custom cache for rendered
+    /// SQL; `None` uses the default disk-backed cache, which writes under
+    /// the project's target directory. Embedding hosts (e.g. language
+    /// servers) pass an in-memory implementation to avoid writing into the
+    /// user's target directory.
     #[allow(clippy::too_many_arguments)]
     pub async fn initialize_server(
         feature_stack: &Arc<FeatureStack>,
@@ -1337,6 +1358,7 @@ impl DbtProjectCompilation {
         cli: &Cli,
         jinja_type_checking_event_listener_factory: Arc<dyn JinjaTypeCheckingEventListenerFactory>,
         prev_compilation: Option<Arc<DbtProjectCompilation>>,
+        compiled_sql_cache: Option<Arc<dyn CompiledSqlCache>>,
         token: &CancellationToken,
     ) -> FsResult<(
         DbtProjectCompilation,
@@ -1352,6 +1374,7 @@ impl DbtProjectCompilation {
             use_resolver_state_deps: true,
             no_version_check: true,
             use_full_schema_store: true,
+            compiled_sql_cache,
         };
 
         DbtProjectCompilation::initialize(
@@ -2055,9 +2078,12 @@ impl DbtProjectCompilation {
         };
 
         // FEATURES: build_cache render
-        let compiled_sql_cache = previous_cache_state
-            .map(|x| x.compiled_sql_cache.clone())
-            .unwrap_or_else(|| Arc::new(CompiledSqlCacheImpl::default()));
+        let compiled_sql_cache = resolve_compiled_sql_cache(
+            previous_cache_state
+                .as_ref()
+                .map(|x| x.compiled_sql_cache.clone()),
+            self.loaded_project().config().compiled_sql_cache.clone(),
+        );
         if let Some(prev_changed_nodes) = compilation_cache_changes.map(|x| {
             // If any yml files were changed, invalidate
             // the impacted nodes as they need to be re-rendered because
@@ -3080,5 +3106,69 @@ mod tests {
             &FsCommand::Freshness,
             &schedule
         ));
+    }
+
+    mod resolve_compiled_sql_cache {
+        use std::path::PathBuf;
+
+        use dbt_common::io_args::IoArgs;
+        use dbt_common::{CompiledSpans, FsResult, MacroSpan};
+        use dbt_frontend_common::span::ReclassifySpan;
+        use dbt_schemas::schemas::CommonAttributes;
+
+        use super::super::{CompiledSqlCache, resolve_compiled_sql_cache};
+        use std::sync::Arc;
+
+        struct StubCache;
+
+        impl CompiledSqlCache for StubCache {
+            fn get_compiled_sql_path(&self, _io: &IoArgs, _common: &CommonAttributes) -> PathBuf {
+                PathBuf::new()
+            }
+
+            fn try_get_compiled_sql(
+                &self,
+                _io: &IoArgs,
+                _common: &CommonAttributes,
+            ) -> Option<(String, Vec<MacroSpan>, Vec<ReclassifySpan>)> {
+                None
+            }
+
+            fn set_compiled_sql(
+                &self,
+                _io: &IoArgs,
+                _common: &CommonAttributes,
+                _rendered_sql_maybe_with_cte: &str,
+                _spans: &dyn CompiledSpans,
+            ) -> FsResult<()> {
+                Ok(())
+            }
+
+            fn clear(&self, _unique_id: &str) {}
+        }
+
+        #[test]
+        fn previous_cache_state_wins_over_config_cache() {
+            let prev: Arc<dyn CompiledSqlCache> = Arc::new(StubCache);
+            let cfg: Arc<dyn CompiledSqlCache> = Arc::new(StubCache);
+            let got = resolve_compiled_sql_cache(Some(prev.clone()), Some(cfg.clone()));
+            assert!(Arc::ptr_eq(&got, &prev));
+            assert!(!Arc::ptr_eq(&got, &cfg));
+        }
+
+        #[test]
+        fn config_cache_used_when_no_previous_state() {
+            let cfg: Arc<dyn CompiledSqlCache> = Arc::new(StubCache);
+            let got = resolve_compiled_sql_cache(None, Some(cfg.clone()));
+            assert!(Arc::ptr_eq(&got, &cfg));
+        }
+
+        #[test]
+        fn defaults_to_disk_backed_cache() {
+            // The disk-backed default is lazy: constructing it performs no IO,
+            // so resolving with neither source must succeed without touching
+            // the filesystem.
+            let _got = resolve_compiled_sql_cache(None, None);
+        }
     }
 }
