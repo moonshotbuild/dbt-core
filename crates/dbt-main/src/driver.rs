@@ -13,17 +13,29 @@ use dbt_jinja_utils::{
 };
 use dbt_schemas::schemas::DbtCommandExecutionArtifacts;
 
-use dbt_tasks_core::task_runner_hooks::TaskRunnerHooksFactory;
+use dbt_tasks_core::{CompiledSqlCache, task_runner_hooks::TaskRunnerHooksFactory};
 
 use crate::compilation::{DbtProjectCompilation, DbtProjectCompilationCacheState};
 
 pub struct DbtCompilationDriver {
     feature_stack: Arc<FeatureStack>,
+    compiled_sql_cache: Option<Arc<dyn CompiledSqlCache>>,
 }
 
 impl DbtCompilationDriver {
     pub fn new(feature_stack: Arc<FeatureStack>) -> Self {
-        Self { feature_stack }
+        Self {
+            feature_stack,
+            compiled_sql_cache: None,
+        }
+    }
+
+    /// Supplies a custom compiled-SQL cache (e.g. an in-memory cache for
+    /// embedding hosts). When not set, the default disk-backed cache is
+    /// used, which writes under the project's target directory.
+    pub fn with_compiled_sql_cache(mut self, cache: Arc<dyn CompiledSqlCache>) -> Self {
+        self.compiled_sql_cache = Some(cache);
+        self
     }
 }
 
@@ -60,6 +72,7 @@ impl CompilationDriver for DbtCompilationDriver {
             cli,
             jinja_type_checking_factory,
             prev_concrete,
+            self.compiled_sql_cache.clone(),
             token,
         )
         .await?;
