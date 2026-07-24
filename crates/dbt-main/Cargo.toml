@@ -82,6 +82,7 @@ default = ["embed-ui"]
 embed-ui = ["dbt-docs-server/embed-ui"]
 
 [dev-dependencies]
+dbt-frontend-common = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }
 

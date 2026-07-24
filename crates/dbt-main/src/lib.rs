@@ -13,6 +13,7 @@ pub mod vars;
 pub mod version_check;
 
 pub use dbt_clap_core::from_lib;
+pub use dbt_tasks_core::CompiledSqlCache;
 
 pub mod partial_parse;
 pub mod uninstall;
