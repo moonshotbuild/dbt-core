@@ -18,9 +18,17 @@ use sha1::Digest;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use tokio::fs as tokiofs;
 use tokio::io::AsyncBufRead;
-use tokio_tar::{Archive, EntryType};
+use tokio_tar::{Archive, ArchiveBuilder, EntryType};
 use tokio_util::io::StreamReader;
+
+/// Maximum number of entries accepted from a single archive.
+const MAX_ENTRIES: usize = 100_000;
+/// Maximum declared uncompressed size of a single entry.
+const MAX_ENTRY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Maximum declared uncompressed size of a whole archive.
+const MAX_TOTAL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// Client for downloading and extracting tarball archives.
 #[derive(Clone)]
@@ -108,7 +116,10 @@ impl TarballClient {
         };
 
         let decoder = GzipDecoder::new(reader);
-        let archive = Archive::new(decoder);
+        // Package archives are untrusted input. `overwrite(false)`: extraction
+        // always targets a freshly created directory, so no entry legitimately
+        // needs to clobber another.
+        let archive = ArchiveBuilder::new(decoder).set_overwrite(false).build();
 
         self.extract_archive(archive, download_url, target_path, strip_root, subdirectory)
             .await
@@ -129,6 +140,18 @@ impl TarballClient {
     where
         R: tokio::io::AsyncRead + Unpin,
     {
+        // Resolve the extraction root once so per-entry containment checks compare
+        // fully resolved paths (the root itself is often below a symlink, e.g.
+        // /var -> /private/var on macOS).
+        let canonical_root = tokiofs::canonicalize(target_path).await.map_err(|e| {
+            fs_err!(
+                ErrorCode::IoError,
+                "Failed to resolve extraction root {}: {}",
+                target_path.display(),
+                e
+            )
+        })?;
+
         let mut entries = archive
             .entries()
             .map_err(|e| fs_err!(ErrorCode::IoError, "Failed to read tar entries: {}", e))?;
@@ -136,12 +159,47 @@ impl TarballClient {
         let mut root_dir: Option<String> = None;
         let mut prefix = PathBuf::new();
         let mut extracted_any = false;
+        let mut entry_count: usize = 0;
+        let mut total_bytes: u64 = 0;
 
         while let Some(entry_result) = entries.next().await {
             self.cancellation.check_cancellation()?;
 
             let mut entry = entry_result
                 .map_err(|e| fs_err!(ErrorCode::IoError, "Failed to read tar entry: {}", e))?;
+
+            // Bound resource consumption before doing any work with the entry. Tar
+            // is size-prefixed, so the declared header size is what gets written.
+            entry_count += 1;
+            if entry_count > MAX_ENTRIES {
+                return err!(
+                    ErrorCode::InvalidConfig,
+                    "Tarball from {} exceeds the maximum entry count ({})",
+                    download_url,
+                    MAX_ENTRIES
+                );
+            }
+            let entry_size = entry.header().size().unwrap_or(0);
+            if entry_size > MAX_ENTRY_BYTES {
+                return err!(
+                    ErrorCode::InvalidConfig,
+                    "Tar entry exceeds the maximum entry size ({} bytes): {}",
+                    MAX_ENTRY_BYTES,
+                    entry
+                        .path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                );
+            }
+            total_bytes = total_bytes.saturating_add(entry_size);
+            if total_bytes > MAX_TOTAL_BYTES {
+                return err!(
+                    ErrorCode::InvalidConfig,
+                    "Tarball from {} exceeds the maximum uncompressed size ({} bytes)",
+                    download_url,
+                    MAX_TOTAL_BYTES
+                );
+            }
 
             let entry_path: PathBuf = entry
                 .path()
@@ -258,6 +316,29 @@ impl TarballClient {
                 ensure_dir(parent).await?;
             }
 
+            // Defence in depth: resolve the entry's parent and confirm it is still
+            // inside the extraction root. The ".." component check above misses an
+            // absolute entry path (`Path::join` on an absolute RHS discards the
+            // base, so `target_path.join(relative_path)` becomes just that absolute
+            // path) and any parent that resolves outside the root through a symlink.
+            if let Some(parent) = target_entry_path.parent() {
+                let canonical_parent = tokiofs::canonicalize(parent).await.map_err(|e| {
+                    fs_err!(
+                        ErrorCode::IoError,
+                        "Failed to resolve directory {}: {}",
+                        parent.display(),
+                        e
+                    )
+                })?;
+                if !canonical_parent.starts_with(&canonical_root) {
+                    return err!(
+                        ErrorCode::InvalidConfig,
+                        "Refusing to extract tar entry that escapes the extraction root: {}",
+                        entry_path.display()
+                    );
+                }
+            }
+
             entry.unpack(&target_entry_path).await.map_err(|e| {
                 fs_err!(
                     ErrorCode::IoError,
@@ -353,9 +434,23 @@ mod tests {
 
     /// Extract with root stripping, as package installs do.
     async fn extract(archive_bytes: &[u8], target: &Path) -> FsResult<PathBuf> {
+        extract_into(archive_bytes, target, true, None).await
+    }
+
+    /// Like [`extract`], but lets a test choose `strip_root` and `subdirectory`
+    /// -- the branches the plain `extract` helper leaves fixed.
+    async fn extract_into(
+        archive_bytes: &[u8],
+        target: &Path,
+        strip_root: bool,
+        subdirectory: Option<&str>,
+    ) -> FsResult<PathBuf> {
         let http_client = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let archive = ArchiveBuilder::new(archive_bytes)
+            .set_overwrite(false)
+            .build();
         TarballClient::from_client(http_client, never_cancels())
-            .extract_archive(Archive::new(archive_bytes), TEST_URL, target, true, None)
+            .extract_archive(archive, TEST_URL, target, strip_root, subdirectory)
             .await
     }
 
@@ -645,5 +740,115 @@ mod tests {
 
         assert!(result.is_ok(), "expected download to succeed: {result:?}");
         assert_extracted(&target);
+    }
+
+    /// `Path::join` on an absolute path discards the base, so an absolute entry
+    /// path would write straight to that path if it were not rejected. Neither
+    /// the ".." component check nor the entry-type skip catches this -- only the
+    /// canonicalised containment check does.
+    ///
+    /// strip_root would reject a leading "/" before the path checks run, so this
+    /// is exercised with strip_root disabled. `Header::set_path` itself refuses a
+    /// root path, so the raw header bytes are written directly, as a hostile
+    /// archive would.
+    #[tokio::test]
+    async fn rejects_absolute_entry_path() {
+        const RAW_PATH: &str = "/tmp/dsk-test-absolute-entry-should-not-be-created.txt";
+
+        let mut header = Header::new_gnu();
+        header.set_entry_type(EntryType::Regular);
+        header.set_mode(0o644);
+        header.set_size(5);
+        header.as_old_mut().name[..RAW_PATH.len()].copy_from_slice(RAW_PATH.as_bytes());
+        header.set_cksum();
+        let mut builder = Builder::new(Vec::new());
+        builder.append(&header, &b"OWNED"[..]).await.unwrap();
+        let bytes = builder.into_inner().await.unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let result = extract_into(&bytes, dir.path(), false, None).await;
+
+        assert_rejected(&result, "escapes the extraction root", "absolute path");
+        assert!(
+            !Path::new(RAW_PATH).exists(),
+            "the absolute path must not have been created"
+        );
+    }
+
+    /// The extraction root itself sitting under a symlink is the case the
+    /// containment check canonicalises for -- it mirrors `/var -> /private/var`
+    /// on macOS and symlinked `TMPDIR`s. A legitimate package must still install:
+    /// the resolved children are inside the resolved root, so nothing is flagged
+    /// as an escape.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn extracts_into_a_symlinked_root() {
+        let real = tempfile::tempdir().unwrap();
+        let target = real.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = real.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let mut builder = Builder::new(Vec::new());
+        append_file(&mut builder, PROJECT_YML, b"name: bad_package\n").await;
+        append_file(&mut builder, "bad_package/models/a.sql", b"select 1\n").await;
+        let bytes = builder.into_inner().await.unwrap();
+
+        let result = extract_into(&bytes, &link, true, None).await;
+
+        assert!(result.is_ok(), "expected success, got {:?}", result.err());
+        assert_eq!(
+            std::fs::read_to_string(target.join("models/a.sql")).unwrap(),
+            "select 1\n"
+        );
+    }
+
+    /// An entry declaring a size it does not carry, for the size-cap check,
+    /// which must reject before reading any of the (here, absent) data.
+    #[tokio::test]
+    async fn rejects_entry_over_the_size_cap() {
+        let mut builder = Builder::new(Vec::new());
+        append_file(&mut builder, PROJECT_YML, b"name: bad_package\n").await;
+        let mut header = Header::new_gnu();
+        header.set_entry_type(EntryType::Regular);
+        header.set_mode(0o644);
+        header.set_size(MAX_ENTRY_BYTES + 1);
+        header.set_path("bad_package/bomb.bin").unwrap();
+        header.set_cksum();
+        builder.append(&header, &b""[..]).await.unwrap();
+        let bytes = builder.into_inner().await.unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = extraction_root(&tmp);
+        let result = extract(&bytes, &target).await;
+
+        assert_rejected(&result, "maximum entry size", "oversized entry");
+    }
+
+    // The running-total cap (MAX_TOTAL_BYTES) and the entry-count cap
+    // (MAX_ENTRIES) are deliberately not unit tested here: both reject on the
+    // declared header size/count alone (see the check above), so a dedicated
+    // test would only re-exercise the same code path with a different constant.
+
+    /// `overwrite(false)`: a second entry at the same path must not clobber the
+    /// first. Malformed or hostile archives can carry duplicate paths; nothing
+    /// legitimate needs one entry to replace another mid-extraction.
+    #[tokio::test]
+    async fn rejects_duplicate_entry_overwrite() {
+        let mut builder = Builder::new(Vec::new());
+        append_file(&mut builder, PROJECT_YML, b"name: bad_package\n").await;
+        append_file(&mut builder, "bad_package/dbt_project.yml", b"OVERWRITTEN\n").await;
+        let bytes = builder.into_inner().await.unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = extraction_root(&tmp);
+        let result = extract(&bytes, &target).await;
+
+        assert!(result.is_err(), "expected the duplicate entry to be rejected");
+        assert_eq!(
+            std::fs::read(target.join("dbt_project.yml")).unwrap(),
+            b"name: bad_package\n",
+            "the original entry must survive the rejected overwrite attempt"
+        );
     }
 }
