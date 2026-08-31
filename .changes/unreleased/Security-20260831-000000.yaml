@@ -1,0 +1,12 @@
+kind: Security
+body: Contain every extracted package-tarball entry within the extraction root, cap
+    entry count and uncompressed size, and disable overwrite during extraction (and
+    the equivalent self-update archive path). Closes an arbitrary-file-write route
+    an absolute or crafted entry path could still reach after symlink/hard-link/device
+    entries were skipped, and a decompression-bomb resource-exhaustion route via
+    entry count/size.
+time: 2026-08-31T00:00:00.000000+08:00
+custom:
+    author: joshuataylor
+    issue: ""
+    project: dbt-core
