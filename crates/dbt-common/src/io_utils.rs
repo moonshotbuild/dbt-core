@@ -30,6 +30,30 @@ pub trait StatusReporter: Any + Send + Sync {
     fn bulk_publish_empty(&self, file_paths: Vec<DbtPath>);
 }
 
+/// An injectable in-memory sink for a load's per-invocation scratch files.
+///
+/// A server/analysis load renders a handful of intermediate SQL files --
+/// ephemeral-model CTEs, synthetic snapshot and generic-test SQL, and hook
+/// renders -- that dbt writes under the target directory and (for all but the
+/// hooks) reads back within the same load. When an embedder installs a
+/// `ScratchFs` on [`crate::io_args::IoArgs::scratch_fs`], those writes go here
+/// instead of to disk and the matching reads consult it first, so a load can
+/// leave the filesystem untouched. `None` (the default) keeps dbt's
+/// disk-backed behaviour.
+///
+/// Keyed by the absolute path dbt would have written: a `read` after a `write`
+/// of the same path returns the stored contents; a `read` of a path that was
+/// never written here (a real project source file) returns `None`, and the
+/// caller falls back to the real filesystem. Implementations must be safe to
+/// call concurrently.
+pub trait ScratchFs: Send + Sync {
+    /// Store `contents` for `path` in memory instead of writing it to disk.
+    fn write(&self, path: &Path, contents: &str);
+    /// Return the stored contents for `path`, or `None` if nothing was stored
+    /// for it (the caller then reads the real filesystem).
+    fn read(&self, path: &Path) -> Option<String>;
+}
+
 /// Reads the contents of a file as a string.
 pub fn try_read_yml_to_str(path: &Path) -> FsResult<String> {
     let mut file = File::open(path).map_err(|e| {
