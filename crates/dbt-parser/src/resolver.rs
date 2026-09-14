@@ -811,8 +811,12 @@ pub async fn resolve_inner(
 
     let mut collected_generic_tests: Vec<GenericTestAsset> = Vec::new();
 
+    // Skip creating the `generic_tests` directory when an in-memory ScratchFs is
+    // installed -- the generated test SQL goes there, so no directory is needed.
     let dbt_tests_dir = arg.io.out_dir.join(DBT_GENERIC_TESTS_DIR_NAME);
-    stdfs::create_dir_all(&dbt_tests_dir)?;
+    if arg.io.scratch_fs.is_none() {
+        stdfs::create_dir_all(&dbt_tests_dir)?;
+    }
 
     let dependency_package_name = dependency_package_name_from_ctx(&jinja_env, &base_ctx);
     let mut typed_models_properties: BTreeMap<String, ModelProperties> = BTreeMap::new();

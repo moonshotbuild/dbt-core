@@ -2,7 +2,7 @@ use dbt_adapter::Adapter;
 use dbt_adapter::relation::render_effective_relation;
 use dbt_adapter_core::AdapterType;
 use dbt_common::{ErrorCode, FsError, fs_err};
-use dbt_common::{FsResult, constants::DBT_CTE_PREFIX, error::MacroSpan, stdfs};
+use dbt_common::{FsResult, constants::DBT_CTE_PREFIX, error::MacroSpan, io_utils::ScratchFs, stdfs};
 use dbt_frontend_common::{error::CodeLocation, span::Span};
 use dbt_schemas::schemas::common::ResolvedQuoting;
 use dbt_schemas::schemas::project::ResolvableConfig;
@@ -176,14 +176,25 @@ pub fn inject_and_persist_ephemeral_models(
     model_name: &str,
     is_current_model_ephemeral: bool,
     ephemeral_dir: &Path,
+    scratch_fs: Option<&Arc<dyn ScratchFs>>,
 ) -> FsResult<String> {
+    // Write the ephemeral model's SQL for `path`, to the injected in-memory
+    // `ScratchFs` when one is set, else to disk (creating the dir).
+    let persist = |path: &Path, contents: String| -> FsResult<()> {
+        if let Some(fs) = scratch_fs {
+            fs.write(path, &contents);
+            return Ok(());
+        }
+        stdfs::create_dir_all(path.parent().unwrap())?;
+        stdfs::write(path, contents)
+    };
+
     if !sql.contains(DBT_CTE_PREFIX) {
         // Write the ephemeral model to the ephemeral directory
         if is_current_model_ephemeral {
             let ephemeral_path = ephemeral_dir.join(format!("{model_name}.sql"));
-            stdfs::create_dir_all(ephemeral_path.parent().unwrap())?;
-            stdfs::write(
-                ephemeral_path,
+            persist(
+                &ephemeral_path,
                 format!("{DBT_CTE_PREFIX}{model_name} as (\n{sql}\n)"),
             )?;
         }
@@ -201,16 +212,19 @@ pub fn inject_and_persist_ephemeral_models(
 
     for model_name in ephemeral_model_names {
         let ephemeral_path = ephemeral_dir.join(format!("{model_name}.sql"));
-        let ephemeral_sql = match stdfs::read_to_string(&ephemeral_path) {
-            Ok(ephemeral_sql) => ephemeral_sql,
-            Err(err) if local_ephemeral_cte_names.contains(model_name) => {
-                match stdfs::exists(&ephemeral_path) {
-                    Ok(false) => continue,
-                    Ok(true) => return Err(err),
-                    Err(err) => return Err(err),
+        let ephemeral_sql = match scratch_fs.and_then(|fs| fs.read(&ephemeral_path)) {
+            Some(ephemeral_sql) => ephemeral_sql,
+            None => match stdfs::read_to_string(&ephemeral_path) {
+                Ok(ephemeral_sql) => ephemeral_sql,
+                Err(err) if local_ephemeral_cte_names.contains(model_name) => {
+                    match stdfs::exists(&ephemeral_path) {
+                        Ok(false) => continue,
+                        Ok(true) => return Err(err),
+                        Err(err) => return Err(err),
+                    }
                 }
-            }
-            Err(err) => return Err(err),
+                Err(err) => return Err(err),
+            },
         };
 
         // Split existing CTEs and add any new ones
@@ -226,10 +240,9 @@ pub fn inject_and_persist_ephemeral_models(
     // this avoid graph walk for ephemeral models
     if is_current_model_ephemeral {
         let ephemeral_path = ephemeral_dir.join(format!("{model_name}.sql"));
-        stdfs::create_dir_all(ephemeral_path.parent().unwrap())?;
         let cte_line = format!("{DBT_CTE_PREFIX}{model_name} as (\n{final_sql}\n)");
         all_ctes.push(cte_line);
-        stdfs::write(ephemeral_path, all_ctes.join(sep))?;
+        persist(&ephemeral_path, all_ctes.join(sep))?;
         all_ctes.pop();
     }
 

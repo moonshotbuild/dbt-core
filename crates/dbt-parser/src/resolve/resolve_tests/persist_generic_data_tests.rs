@@ -425,8 +425,7 @@ fn persist_inner(
         }
     }
     // Explicit test names (`name: customer/id_not_null`) can carry `/` straight into the generic-test SQL path.
-    stdfs::create_dir_all(test_file.parent().unwrap())?;
-    stdfs::write(&test_file, generated_test_sql)?;
+    io_args.scratch_write(&test_file, &generated_test_sql)?;
     let dbt_asset = DbtAsset {
         path,
         original_path: original_file_path.to_path_buf(),

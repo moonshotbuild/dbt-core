@@ -430,7 +430,18 @@ where
     }
 
     let absolute_path = dbt_asset.base_path.join(&dbt_asset.path);
-    let sql = read_to_string(&absolute_path).await.map_err(|e| *e)?;
+    // Synthetic assets (snapshots, generic tests) may have been rendered into
+    // an injected in-memory `ScratchFs` instead of disk; consult it first, then
+    // fall back to reading a real project source file from disk.
+    let sql = match args
+        .io
+        .scratch_fs
+        .as_ref()
+        .and_then(|fs| fs.read(&absolute_path))
+    {
+        Some(sql) => sql,
+        None => read_to_string(&absolute_path).await.map_err(|e| *e)?,
+    };
 
     let sql_resources = Arc::new(Mutex::new(Vec::new()));
     let execute_exists = Arc::new(AtomicBool::new(false));

@@ -1099,6 +1099,7 @@ pub fn materialize_microbatch_model(
         jinja_env.clone(),
         &run_node_context,
         &io_args.out_dir,
+        io_args.scratch_fs.as_ref(),
     )?;
 
     let adapter = jinja_env.get_base_adapter().ok_or_else(|| {
