@@ -119,9 +119,10 @@ pub async fn resolve_snapshots(
 
     let package_name = package.dbt_project.name.to_owned();
 
-    // Create the `snapshots` directory
+    // Create the `snapshots` directory (skipped when an in-memory ScratchFs is
+    // installed -- the snapshot SQL goes there, so no directory is needed).
     let snapshots_dir = arg.io.out_dir.join(DBT_SNAPSHOTS_DIR_NAME);
-    if !snapshots_dir.exists() {
+    if arg.io.scratch_fs.is_none() && !snapshots_dir.exists() {
         stdfs::create_dir_all(&snapshots_dir)?;
     }
 
@@ -156,10 +157,7 @@ pub async fn resolve_snapshots(
             let target_path = PathBuf::from(DBT_SNAPSHOTS_DIR_NAME)
                 .join(original_relative_path.with_file_name(format!("{snapshot_name}.sql")));
             let snapshot_path = arg.io.out_dir.join(&target_path);
-            if let Some(parent) = snapshot_path.parent() {
-                stdfs::create_dir_all(parent)?;
-            }
-            stdfs::write(snapshot_path, macro_call)?;
+            arg.io.scratch_write(&snapshot_path, &macro_call)?;
 
             // Track original path for checksum recalculation.
             snapshot_original_paths.insert(
@@ -266,10 +264,7 @@ pub async fn resolve_snapshots(
                     )
                     .join(format!("{snapshot_name}.sql"));
                 let snapshot_path = arg.io.out_dir.join(&target_path);
-                if let Some(parent) = snapshot_path.parent() {
-                    stdfs::create_dir_all(parent)?;
-                }
-                stdfs::write(&snapshot_path, &sql)?;
+                arg.io.scratch_write(&snapshot_path, &sql)?;
                 // Compute the original file path relative to in_dir
                 // For package YAML snapshots, this includes the package path
                 let original_path = get_original_file_path(
