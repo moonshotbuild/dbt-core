@@ -15,6 +15,7 @@ use dbt_adapter::relation::create_relation_from_node;
 use dbt_adapter_core::AdapterType;
 use dbt_common::FsResult;
 use dbt_common::constants::DBT_EPHEMERAL_DIR_NAME;
+use dbt_common::io_utils::ScratchFs;
 use dbt_jinja_utils::jinja_environment::JinjaEnv;
 use dbt_jinja_utils::phases::compile::DependencyValidationConfig;
 use dbt_jinja_utils::phases::run::RunConfig;
@@ -270,6 +271,7 @@ pub fn render_batch_sql(
     jinja_env: Arc<JinjaEnv>,
     jinja_context: &BTreeMap<String, Value>,
     out_dir: &Path,
+    scratch_fs: Option<&Arc<dyn ScratchFs>>,
 ) -> FsResult<String> {
     // Render the raw SQL through Jinja
     // The context already contains config from build_run_node_context
@@ -288,6 +290,7 @@ pub fn render_batch_sql(
         "microbatch_not_persisted", // can be anything; only used to persist an ephemeral model
         false,                      // a microbatch model cannot be ephemeral
         &out_dir.join(DBT_EPHEMERAL_DIR_NAME),
+        scratch_fs,
     )?;
 
     tracing::debug!("Rendered batch SQL w/ injected CTE (first 200 chars): {rendered:.200}...",);
