@@ -168,7 +168,7 @@ impl Display for InternalPackageMode {
 }
 use crate::{
     constants::{DBT_GENERIC_TESTS_DIR_NAME, DBT_SNAPSHOTS_DIR_NAME},
-    io_utils::StatusReporter,
+    io_utils::{ScratchFs, StatusReporter},
     node_selector::{
         IndirectSelection, SelectExpression, SelectionCriteria, conjoin_expression,
         parse_model_specifiers,
@@ -348,6 +348,12 @@ pub struct IoArgs {
 
     /// Optional status reporter for reporting status messages during execution
     pub status_reporter: Option<Arc<dyn StatusReporter>>,
+
+    /// Optional in-memory sink for a load's scratch files (ephemeral CTEs,
+    /// synthetic snapshot/generic-test SQL, hook renders). When set, dbt keeps
+    /// those intermediate files in memory instead of writing them under the
+    /// target directory. `None` (the default) keeps the disk-backed behaviour.
+    pub scratch_fs: Option<Arc<dyn ScratchFs>>,
     pub send_anonymous_usage_stats: bool,
 
     // internal fields
@@ -361,6 +367,39 @@ impl IoArgs {
         let out_dir_last = self.out_dir.components().next_back();
         let rel_first = rel_path.components().next();
         out_dir_last == rel_first
+    }
+
+    /// Write `contents` for `path`, honouring an installed [`ScratchFs`].
+    ///
+    /// With a [`ScratchFs`](crate::io_utils::ScratchFs) set the content is kept
+    /// in memory and no file (or parent directory) is created; otherwise it is
+    /// written to disk, creating the parent directory first. Used for the
+    /// per-load scratch renders (ephemeral CTEs, synthetic snapshot and
+    /// generic-test SQL, hook renders).
+    pub fn scratch_write(&self, path: &Path, contents: &str) -> crate::FsResult<()> {
+        if let Some(fs) = &self.scratch_fs {
+            fs.write(path, contents);
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            crate::stdfs::create_dir_all(parent)?;
+        }
+        crate::stdfs::write(path, contents)
+    }
+
+    /// Read `path` as a string, consulting an installed
+    /// [`ScratchFs`](crate::io_utils::ScratchFs) first.
+    ///
+    /// Content stored via [`scratch_write`](Self::scratch_write) is returned
+    /// from memory; anything else (e.g. a real project source file) falls back
+    /// to reading `path` from disk.
+    pub fn scratch_read_to_string(&self, path: &Path) -> crate::FsResult<String> {
+        if let Some(fs) = &self.scratch_fs {
+            if let Some(contents) = fs.read(path) {
+                return Ok(contents);
+            }
+        }
+        crate::stdfs::read_to_string(path)
     }
 
     pub fn max_log_verbosity(&self) -> LevelFilter {
