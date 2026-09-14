@@ -121,6 +121,7 @@ pub async fn run_operation_inline_sql(
             INLINE_SQL_NAME,
             /* is_current_model_ephemeral = */ false,
             &io_args.out_dir.join(DBT_EPHEMERAL_DIR_NAME),
+            io_args.scratch_fs.as_ref(),
         )?
     } else {
         rendered_user_sql
@@ -228,6 +229,7 @@ fn precompile_ephemeral_models(
             &model.__base_attr__.alias,
             /* is_current_model_ephemeral = */ true,
             &ephemeral_dir,
+            io_args.scratch_fs.as_ref(),
         )?;
     }
 
@@ -365,10 +367,17 @@ pub async fn run_operation_on_run(
     // mirroring the run path obtained above and dbt-core's nested operation layout.
     let compiled_path =
         operation.get_node_path_abs(NodePathKind::Compiled, &io_args.in_dir, &io_args.out_dir);
-    if let Some(parent) = compiled_path.parent() {
-        tokiofs::create_dir_all(parent).await?;
+    if let Some(fs) = &io_args.scratch_fs {
+        // Hook renders are pure artefact persistence -- they are executed inline
+        // and never read back within a load -- so an injected in-memory sink
+        // keeps them off disk.
+        fs.write(&compiled_path, &rendered_sql);
+    } else {
+        if let Some(parent) = compiled_path.parent() {
+            tokiofs::create_dir_all(parent).await?;
+        }
+        tokiofs::write(compiled_path, rendered_sql.as_bytes()).await?;
     }
-    tokiofs::write(compiled_path, rendered_sql.as_bytes()).await?;
     Ok(rendered_sql)
 }
 
