@@ -1,0 +1,10 @@
+kind: Security
+body: Refuse to install a package whose `dbt_project.yml` `name:` is not a single
+    directory name. The name was joined onto `dbt_packages` with no check, so an
+    absolute or `..` name made `dbt deps` write the whole package tree anywhere on
+    the machine.
+time: 2026-10-07T10:02:00.000000+08:00
+custom:
+    author: joshuataylor
+    issue: ""
+    project: dbt-core
