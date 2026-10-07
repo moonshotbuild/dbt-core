@@ -130,6 +130,9 @@ pub async fn clean_project(
 
         for path in &paths_to_delete {
             if path.exists() {
+                // `inside_project` and `unrelated_paths` only collapse `..` without checking for a symlink, so a symlink in the project can route the real delete outside the project or onto a protected directory.
+                // Re-check on the canonical paths before leasing, and fail closed.
+                canonical_safe_to_delete(&arg.io.in_dir, path, &protected_paths)?;
                 if path.eq(&default_target_dir) {
                     // We have already acquired the lease for this directory at this point.
                     lease_guards.push((
@@ -222,6 +225,85 @@ fn inside_project<P: AsRef<Path>, Q: AsRef<Path>>(in_dir: P, path: Q) -> bool {
     contained
 }
 
+/// Check an existing delete target against the project root and the protected directories using canonical paths.
+///
+/// [`inside_project`] and [`unrelated_paths`] work on the `..`-collapsed path, so they only see the lexical shape of it.
+/// A symlink inside the project gets past both. With `project/link -> /hello_world`, `clean-targets: ["link/victim"]`
+/// collapses to `project/link/victim`, which starts with the project root, but `remove_dir_all` follows the link and
+/// deletes `/hello_world/victim`. With `project/link -> project`, `clean-targets: ["link/models"]` looks unrelated to
+/// `project/models` but is the same directory.
+///
+/// Resolving the parent chain through `canonicalize` removes the symlinks before the two checks run.
+///
+/// The leaf itself is left unresolved. `remove_dir_all` unlinks a symlink leaf rather than following it, so a
+/// `target/` that is a symlink to another disk is still cleanable. [`inside_project`] has already established that the
+/// leaf is a real component and not the root.
+///
+/// A path that cannot be resolved is refused, not deleted.
+fn canonical_safe_to_delete<P: AsRef<Path>, Q: AsRef<Path>>(
+    in_dir: P,
+    path: Q,
+    protected_paths: &[DbtPath],
+) -> FsResult<()> {
+    let in_dir = in_dir.as_ref();
+    let path = path.as_ref();
+    let Some(parent) = path.parent() else {
+        return err!(
+            ErrorCode::InvalidPath,
+            "Refusing to clean '{}': it has no parent directory",
+            path.display()
+        );
+    };
+
+    let (Ok(canonical_root), Ok(canonical_parent)) =
+        (stdfs::canonicalize(in_dir), stdfs::canonicalize(parent))
+    else {
+        return err!(
+            ErrorCode::InvalidPath,
+            "Refusing to clean '{}': dbt could not resolve it to confirm it stays inside the \
+             project directory {}",
+            path.display(),
+            in_dir.display()
+        );
+    };
+
+    // The real top-level entry `remove_dir_all` operates on: the resolved parent plus the leaf's own name (the leaf itself is left unresolved).
+    let canonical_target = match path.file_name() {
+        Some(name) => canonical_parent.join(name),
+        None => canonical_parent.clone(),
+    };
+
+    if !canonical_parent.starts_with(&canonical_root) {
+        return err!(
+            ErrorCode::InvalidPath,
+            "Refusing to clean '{}': it resolves to {}, which is not inside the project directory {}",
+            path.display(),
+            canonical_target.display(),
+            canonical_root.display()
+        );
+    }
+
+    for protected in protected_paths {
+        // A protected path that does not exist cannot be the resolved target of a delete, so there is nothing to canonicalize or guard against.
+        let Ok(canonical_protected) = stdfs::canonicalize(protected) else {
+            continue;
+        };
+        // Unsafe when the target is the protected directory or an ancestor of it -- deleting the target would take the protected directory with it.
+        if canonical_protected.starts_with(&canonical_target) {
+            return err!(
+                ErrorCode::InvalidPath,
+                "Refusing to clean '{}': it resolves to {}, which would remove the protected \
+                 directory {}",
+                path.display(),
+                canonical_target.display(),
+                canonical_protected.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn unrelated_paths<P: AsRef<Path>, Q: AsRef<Path>>(to: P, from: Q) -> bool {
     match stdfs::diff_paths(&to, &from).and_then(|diff| {
         // It is safe to delete a directory if the only way to get to a protected directory is to navigate to the parent.
@@ -264,5 +346,45 @@ mod tests {
             in_dir,
             DbtPath::absolute("/project2").unwrap()
         ));
+    }
+
+    /// `canonical_safe_to_delete` must resolve intermediate symlinks BEFORE deleting, refusing targets that escape the project or land on a protected directory.
+    /// while leaving genuinely safe targets (including a symlinked leaf, which `remove_dir_all` only unlinks) cleanable.
+    #[cfg(unix)]
+    #[test]
+    fn canonical_safe_to_delete_resolves_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let project = root.join("project");
+        let outside = root.join("outside");
+        let models = project.join("models");
+        stdfs::create_dir_all(project.join("real_sub")).unwrap();
+        stdfs::create_dir_all(&models).unwrap();
+        stdfs::create_dir_all(outside.join("victim")).unwrap();
+
+        let protected = vec![DbtPath::absolute(&models).unwrap()];
+
+        // Intermediate symlink escape: project/link -> outside, so link/victim resolves to outside/victim, outside the project.
+        symlink(&outside, project.join("link")).unwrap();
+        let escaping = DbtPath::absolute(project.join("link/victim")).unwrap();
+        // The lexical check is fooled; the canonical one refuses it.
+        assert!(inside_project(&project, &escaping));
+        assert!(canonical_safe_to_delete(&project, &escaping, &protected).is_err());
+
+        // Intermediate symlink onto a protected dir: project/self -> project, so self/models looks unrelated to models lexically but resolves onto the protected directory.
+        symlink(&project, project.join("self")).unwrap();
+        let onto_protected = DbtPath::absolute(project.join("self/models")).unwrap();
+        assert!(canonical_safe_to_delete(&project, &onto_protected, &protected).is_err());
+
+        // Symlinked leaf to outside: remove_dir_all unlinks the link itself and never touches the target, so this stays cleanable.
+        symlink(&outside, project.join("scratch")).unwrap();
+        let leaf_link = DbtPath::absolute(project.join("scratch")).unwrap();
+        assert!(canonical_safe_to_delete(&project, &leaf_link, &protected).is_ok());
+
+        // A genuine directory inside the project is cleanable.
+        let inside = DbtPath::absolute(project.join("real_sub")).unwrap();
+        assert!(canonical_safe_to_delete(&project, &inside, &protected).is_ok());
     }
 }
