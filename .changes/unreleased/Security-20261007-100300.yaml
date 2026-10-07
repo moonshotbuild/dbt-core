@@ -1,0 +1,10 @@
+kind: Security
+body: Refuse a `packages-install-path` (from `dbt_project.yml` or the command line)
+    that is absolute or resolves outside the project. `dbt deps` removes that
+    directory wholesale before reinstalling, so `../OUTSIDE` deleted an arbitrary
+    directory even when the install then failed.
+time: 2026-10-07T10:03:00.000000+08:00
+custom:
+    author: joshuataylor
+    issue: ""
+    project: dbt-core
