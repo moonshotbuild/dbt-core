@@ -1,0 +1,10 @@
+kind: Security
+body: Keep a project's resource paths (`model-paths`, `macro-paths`, ...) inside that
+    project. An installed package could declare an absolute or `..` path, or commit
+    a symlink, and have files from anywhere on the machine read as its own; an
+    escaping path is now refused and an escaping symlink skipped.
+time: 2026-10-07T10:05:00.000000+08:00
+custom:
+    author: joshuataylor
+    issue: ""
+    project: dbt-core
