@@ -682,6 +682,47 @@ mod tests {
         write_file(&ok, &root, "model", "select 1").unwrap();
         assert!(ok.is_file());
     }
+
+    /// A symlink under the target directory must not redirect the write, or
+    /// the stale-layout reconciliation, outside it; nor may the output file
+    /// itself be a symlink `fs::write` would follow.
+    #[cfg(unix)]
+    #[test]
+    fn write_file_refuses_symlinks_under_the_target_root() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("target");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(root.join("run/pkg")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let victim = outside.join("victim.sql");
+        fs::write(&victim, "keep me").unwrap();
+
+        // Symlinked parent: target/run/pkg/models -> outside.
+        symlink(&outside, root.join("run/pkg/models")).unwrap();
+        let via_parent = root.join("run/pkg/models/victim.sql");
+        let err = write_file(&via_parent, &root, "model", "select 1").unwrap_err();
+        assert!(
+            err.to_string().contains("outside the target directory"),
+            "{err}"
+        );
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep me");
+        // ... including a file that does not exist yet under that parent.
+        assert!(write_file(&root.join("run/pkg/models/new.sql"), &root, "model", "x").is_err());
+        assert!(!outside.join("new.sql").exists());
+
+        // Symlink leaf: target/run/pkg/orders.sql -> outside/victim.sql.
+        symlink(&victim, root.join("run/pkg/orders.sql")).unwrap();
+        let leaf = root.join("run/pkg/orders.sql");
+        let err = write_file(&leaf, &root, "model", "select 1").unwrap_err();
+        assert!(err.to_string().contains("is a symlink"), "{err}");
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep me");
+
+        // A real path under the root still writes.
+        let ok = root.join("run/pkg/real.sql");
+        write_file(&ok, &root, "model", "select 1").unwrap();
+        assert!(ok.is_file());
+    }
 }
 
 fn parse_hook_item(item: &YmlValue) -> Option<HookConfig> {
@@ -809,6 +850,48 @@ fn write_file(
         ));
     }
 
+    // The lexical check cannot see a symlink under the target directory. Resolve
+    // the part of the path that exists and require it to stay under the resolved
+    // root, so a symlinked parent cannot redirect the write (or the stale-layout
+    // reconciliation below) outside it; and refuse a symlink at the output file
+    // itself, which `fs::write` would follow.
+    if fs::symlink_metadata(full_path).is_ok_and(|m| m.is_symlink()) {
+        return Err(Error::new(
+            ErrorKind::InvalidOperation,
+            format!(
+                "Refusing to write {}: the output path is a symlink",
+                full_path.display()
+            ),
+        ));
+    }
+    let canonical_root = canonical_existing_prefix(root.as_path()).map_err(|e| {
+        Error::new(
+            ErrorKind::InvalidOperation,
+            format!(
+                "Failed to resolve the target directory {}: {}",
+                root.as_path().display(),
+                e
+            ),
+        )
+    })?;
+    let canonical = canonical_existing_prefix(normalized.as_path()).map_err(|e| {
+        Error::new(
+            ErrorKind::InvalidOperation,
+            format!("Failed to resolve {}: {}", full_path.display(), e),
+        )
+    })?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(Error::new(
+            ErrorKind::InvalidOperation,
+            format!(
+                "Refusing to write {}: it resolves to {}, which is outside the target directory {}",
+                full_path.display(),
+                canonical.display(),
+                canonical_root.display()
+            ),
+        ));
+    }
+
     // Reconcile a target/ left behind by a different artifact layout — e.g.
     // dbt Core v1, or a pre-#14125 Fusion that wrote snapshot run artifacts as
     // a flat file where we now write a nested directory (or vice versa). Without
@@ -861,6 +944,30 @@ fn write_file(
             ErrorKind::InvalidOperation,
             format!("Failed to write to {}: {}", full_path.display(), e),
         )),
+    }
+}
+
+/// Canonicalise the part of an absolute path that exists and re-append the
+/// rest lexically, so a path that does not exist yet can still be checked
+/// against the resolved target root.
+fn canonical_existing_prefix(path: &Path) -> std::io::Result<PathBuf> {
+    let mut existing = path;
+    let mut remainder: Vec<&std::ffi::OsStr> = Vec::new();
+    loop {
+        if existing.exists() {
+            let mut canonical = fs::canonicalize(existing)?;
+            for component in remainder.iter().rev() {
+                canonical.push(component);
+            }
+            return Ok(canonical);
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                remainder.push(name);
+                existing = parent;
+            }
+            _ => return Err(std::io::Error::other("no existing ancestor")),
+        }
     }
 }
 
