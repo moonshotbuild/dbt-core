@@ -95,16 +95,18 @@ pub struct ResolvedCloudConfig {
     pub defer_job_id: Option<String>,
     pub state_org_id: Option<String>,
     pub job_id: Option<String>,
-    /// The host in [`Self::credentials`] came from `dbt_project.yml`
-    /// (`dbt-cloud.tenant_hostname` / `account_host`), the token came from the
-    /// saved `dbt_cloud.yml`, and the two disagree about the host.
+    /// The host in [`Self::credentials`] came only from `dbt_project.yml`
+    /// (`dbt-cloud.tenant_hostname` / `account_host`): no
+    /// `DBT_CLOUD_ACCOUNT_HOST` was set, and it is not the host the saved
+    /// `dbt_cloud.yml` project is bound to.
     ///
-    /// The project file can name any host, so a checked-in `dbt_project.yml`
-    /// could point the saved token's bearer at a host of its choosing. Callers
-    /// that attach the token to a request against the host must not do so when
-    /// this is set; `DBT_CLOUD_ACCOUNT_HOST` (the user's own override) does not
-    /// trip it.
-    pub host_overrides_saved_token: bool,
+    /// The project file is checked in and may not be the user's own, so it
+    /// must not choose where a credential is sent -- whichever way the token
+    /// arrived. A saved token is bound to its saved host; an environment token
+    /// (CI) is authorised for the host the environment names, not for one the
+    /// project picks. Callers that attach the token to a request against the
+    /// host must not do so when this is set.
+    pub ingest_host_unverified: bool,
 }
 
 #[cfg(test)]
