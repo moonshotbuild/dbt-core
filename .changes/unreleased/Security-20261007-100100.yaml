@@ -1,0 +1,13 @@
+kind: Security
+body: Refuse a model alias that is a path. The alias (set by the model or by any
+    package's `generate_alias_name`) was joined into the ephemeral scratch path
+    on `dbt compile` and into the `target/run` path on `dbt run` with no check, so
+    `alias: "../../x"` or an absolute alias wrote outside the project and, via the
+    stale-layout reconciliation, could delete a file there. The alias must now be
+    a single file name, and every `target/run` write is checked to resolve under
+    the target directory.
+time: 2026-10-07T10:01:00.000000+08:00
+custom:
+    author: joshuataylor
+    issue: ""
+    project: dbt-core

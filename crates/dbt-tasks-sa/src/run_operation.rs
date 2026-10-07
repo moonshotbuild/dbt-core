@@ -323,6 +323,7 @@ pub async fn run_operation_on_run(
                 &io_args.in_dir,
                 &io_args.out_dir,
             ),
+            run_root: io_args.out_dir.clone(),
         }),
     );
 
