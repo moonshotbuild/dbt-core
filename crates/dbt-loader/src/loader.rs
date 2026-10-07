@@ -1476,6 +1476,17 @@ fn contained_install_path(in_dir: &Path, path: &Path, source: &str) -> FsResult<
             in_dir.display()
         ));
     }
+    // The lexical check above cannot see a symlink inside the project; the
+    // install sink's canonical check can, and runs here too so the refusal
+    // names the configured value rather than failing later at deletion.
+    fs_deps::ensure_inside_project(&in_dir.join(path), in_dir).map_err(|e| {
+        fs_err!(
+            ErrorCode::InvalidConfig,
+            "Invalid {source} '{}': {}",
+            path.display(),
+            e.message()
+        )
+    })?;
     Ok(in_dir.join(path))
 }
 
@@ -1613,9 +1624,9 @@ mod tests {
     /// deps-packages-install-path-delete).
     #[test]
     fn packages_install_path_must_stay_inside_the_project() {
-        let in_dir = std::env::temp_dir()
-            .join("dsk-install-path-test")
-            .join("project");
+        let tmp = tempfile::tempdir().unwrap();
+        let in_dir = tmp.path().join("project");
+        fs::create_dir_all(&in_dir).unwrap();
         let project = |p: Option<&str>| -> DbtProjectSimplified {
             let yml = match p {
                 Some(p) => format!("packages-install-path: \"{p}\"\n__ignored__: {{}}\n"),
