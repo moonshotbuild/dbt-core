@@ -99,7 +99,9 @@ export const Links: Story = {
 /**
  * `rehypeRaw` is on, so authored HTML renders as HTML. This is a deliberate
  * divergence from docs v1, which escaped it — and it is why HTML comments in the
- * bundled default overview are invisible rather than printed.
+ * bundled default overview are invisible rather than printed. `rehypeSanitize`
+ * then applies the shared allow-list: the `<b>` and the `<div>` stay, the div's
+ * `style` attribute is dropped.
  */
 export const RawHtml: Story = {
   args: {
