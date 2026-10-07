@@ -2,8 +2,10 @@ import { FC } from 'react';
 import ReactMarkdown from 'react-markdown';
 import rehypeExternalLinks from 'rehype-external-links';
 import rehypeRaw from 'rehype-raw';
+import rehypeSanitize from 'rehype-sanitize';
 import remarkGfm from 'remark-gfm';
 
+import { markdownSanitizeSchema } from '../util/markdownSanitize';
 import { Badge } from './Badge';
 
 type SemanticAspectCardProps = {
@@ -37,7 +39,11 @@ export const SemanticAspectCard: FC<SemanticAspectCardProps> = ({
           <ReactMarkdown
             className="prose prose-sm dark:prose-invert mt-2 w-full min-w-full text-fgDecorative"
             remarkPlugins={[remarkGfm]}
-            rehypePlugins={[rehypeRaw, [rehypeExternalLinks, { target: '_blank' }]]}
+            rehypePlugins={[
+              rehypeRaw,
+              [rehypeSanitize, markdownSanitizeSchema],
+              [rehypeExternalLinks, { target: '_blank' }],
+            ]}
           >
             {description}
           </ReactMarkdown>
