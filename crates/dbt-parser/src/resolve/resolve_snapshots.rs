@@ -60,7 +60,7 @@ use minijinja::Value as MinijinjaValue;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
@@ -156,7 +156,7 @@ pub async fn resolve_snapshots(
 
             let target_path = PathBuf::from(DBT_SNAPSHOTS_DIR_NAME)
                 .join(original_relative_path.with_file_name(format!("{snapshot_name}.sql")));
-            let snapshot_path = arg.io.out_dir.join(&target_path);
+            let snapshot_path = contained_scratch_path(&arg.io.out_dir, &target_path)?;
             arg.io.scratch_write(&snapshot_path, &macro_call)?;
 
             // Track original path for checksum recalculation.
@@ -260,10 +260,10 @@ pub async fn resolve_snapshots(
                     .join(
                         original_relative_path
                             .parent()
-                            .unwrap_or_else(|| std::path::Path::new("")),
+                            .unwrap_or_else(|| Path::new("")),
                     )
                     .join(format!("{snapshot_name}.sql"));
-                let snapshot_path = arg.io.out_dir.join(&target_path);
+                let snapshot_path = contained_scratch_path(&arg.io.out_dir, &target_path)?;
                 arg.io.scratch_write(&snapshot_path, &sql)?;
                 // Compute the original file path relative to in_dir
                 // For package YAML snapshots, this includes the package path
@@ -836,5 +836,41 @@ async fn recalculate_snapshot_checksum(
             emit_warn_log_from_fs_error(*e);
             sql_file_info.checksum.clone()
         }
+    }
+}
+
+/// `out_dir/target_path`, refused unless it stays under `out_dir` once `..`
+/// components collapse. `target_path` carries the snapshot's name and the
+/// properties file's relative directory, both from the (possibly installed)
+/// package, so this is the last check before the synthesised SQL is written.
+fn contained_scratch_path(out_dir: &Path, target_path: &Path) -> FsResult<PathBuf> {
+    let snapshot_path = out_dir.join(target_path);
+    let root = DbtPath::absolute(out_dir)?;
+    let resolved = DbtPath::absolute(&snapshot_path)?;
+    if !resolved.as_path().starts_with(root.as_path()) {
+        return Err(fs_err!(
+            ErrorCode::InvalidConfig,
+            "Refusing to write snapshot SQL to '{}': it resolves outside the target directory {}",
+            snapshot_path.display(),
+            out_dir.display()
+        ));
+    }
+    Ok(snapshot_path)
+}
+
+#[cfg(test)]
+mod scratch_path_tests {
+    use super::contained_scratch_path;
+    use std::path::Path;
+
+    #[test]
+    fn contained_scratch_path_rejects_an_escape() {
+        let out = Path::new("/proj/target");
+        assert_eq!(
+            contained_scratch_path(out, Path::new("snapshots/pkg/orders.sql")).unwrap(),
+            out.join("snapshots/pkg/orders.sql")
+        );
+        assert!(contained_scratch_path(out, Path::new("snapshots/../../macros/evil.sql")).is_err());
+        assert!(contained_scratch_path(out, Path::new("/tmp/evil.sql")).is_err());
     }
 }
