@@ -127,7 +127,7 @@ impl PackageInstaller for HubUnpinnedPackage {
             &pinned.version,
         )?;
 
-        let final_path = dest.join(&metadata.name);
+        let final_path = install_target(dest, &metadata.name)?;
         ensure_dir(&final_path).await?;
 
         if let Err(e) = ctx
@@ -154,6 +154,46 @@ impl PackageInstaller for HubUnpinnedPackage {
 ///
 /// `downloads.sha1` describes the upstream tarball, whose gzip output is not
 /// byte-stable, so it's not a usable substitute for the mirror's own sha1.
+/// The directory a package is installed into: `dest/<name>`, where `name` is
+/// the package's self-declared `dbt_project.yml` `name:` (or the Hub's name
+/// for it).
+///
+/// That name is attacker-controlled for a tarball, git or local package, and
+/// `Path::join` discards `dest` for an absolute name and walks out of it for a
+/// `..` one -- so an installed package could land its whole tree anywhere on
+/// the machine. A project name is a single path component by definition;
+/// refuse anything else and check the join stayed under `dest`.
+fn install_target(dest: &Path, name: &str) -> FsResult<std::path::PathBuf> {
+    validate_package_name(name).map_err(|e| fs_err!(ErrorCode::InvalidConfig, "{}", e))?;
+    let target = dest.join(name);
+    if target.parent() != Some(dest) {
+        return Err(fs_err!(
+            ErrorCode::InvalidConfig,
+            "Package name '{name}' does not resolve to a directory under {}",
+            dest.display()
+        ));
+    }
+    Ok(target)
+}
+
+/// Validate that a package name is a single, normal path component.
+fn validate_package_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("Invalid package name: must not be empty".to_string());
+    }
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(_)), None)
+            if !name.contains('/') && !name.contains('\\') && !name.contains('\0') =>
+        {
+            Ok(())
+        }
+        _ => Err(format!(
+            "Invalid package name '{name}': must be a single directory name, not a path"
+        )),
+    }
+}
+
 fn select_hub_download(
     use_v2_compatible_package_downloads: bool,
     require_hub_verified_downloads: bool,
@@ -291,7 +331,7 @@ impl PackageInstaller for LocalUnpinnedPackage {
         out: &mut InstallOutcome,
     ) -> FsResult<()> {
         let package_path = ctx.io.in_dir.join(&self.local);
-        let install_path = dest.join(self.name.as_ref().unwrap());
+        let install_path = install_target(dest, self.name.as_ref().unwrap())?;
         let relative_package_path = stdfs::diff_paths(&package_path, dest)?;
         stdfs::symlink(&relative_package_path, &install_path)?;
         out.name = Some(
@@ -342,7 +382,10 @@ impl PackageInstaller for TarballUnpinnedPackage {
         let project_name = dbt_project.name;
         out.name = Some(project_name.clone());
         out.version = Some("tarball".to_string());
-        move_dir(&extract_path, &dest.join(&project_name)).await?;
+        let final_path = install_target(dest, &project_name).inspect_err(|_| {
+            let _ = std::fs::remove_dir_all(&extract_path);
+        })?;
+        move_dir(&extract_path, &final_path).await?;
 
         Ok(())
     }
@@ -369,7 +412,8 @@ async fn install_git_like(
     let dbt_project =
         read_and_validate_dbt_project(&checkout_path, false, ctx.jinja_env, ctx.vars).await?;
     out.name = Some(dbt_project.name.clone());
-    move_dir(&checkout_path, &dest.join(&dbt_project.name)).await?;
+    let final_path = install_target(dest, &dbt_project.name)?;
+    move_dir(&checkout_path, &final_path).await?;
     drop(tmp_dir);
 
     Ok(())
@@ -387,6 +431,31 @@ impl UnpinnedPackage {
             UnpinnedPackage::Local(p) => p.install(ctx, dest).await,
             UnpinnedPackage::Private(p) => p.install(ctx, dest).await,
             UnpinnedPackage::Tarball(p) => p.install(ctx, dest).await,
+        }
+    }
+}
+
+#[cfg(test)]
+mod install_target_tests {
+    use super::*;
+
+    #[test]
+    fn install_target_accepts_a_name_and_rejects_a_path() {
+        let dest = Path::new("/proj/dbt_packages");
+        for ok in ["dbt_utils", "my-pkg", "pkg.v2"] {
+            assert_eq!(install_target(dest, ok).unwrap(), dest.join(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../pwned",
+            "a/b",
+            "/tmp/pwned",
+            "C:\\pwned",
+            "x\0y",
+        ] {
+            assert!(install_target(dest, bad).is_err(), "{bad:?}");
         }
     }
 }
