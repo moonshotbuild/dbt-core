@@ -73,7 +73,10 @@ async fn resolve_packages(
     final_listing: &mut PackageListing<'_>,
     package_listing: &mut PackageListing<'_>,
 ) -> FsResult<()> {
+    // Everything in `next_listing` comes from an installed dependency's own
+    // `packages.yml`, so it renders without the host environment.
     let mut next_listing = PackageListing::new(ctx.io.clone(), ctx.vars.clone(), &ctx.notices)
+        .with_restricted_rendering(true)
         .with_skip_private_deps(package_listing.skip_private_deps)
         .with_private_package_resolver(ctx.private_package_resolver.clone())
         .with_cloud_config(ctx.cloud_config.clone());
