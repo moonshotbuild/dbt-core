@@ -27,4 +27,26 @@ impl LoadContext {
             target: Value::from_serialize(BTreeMap::<String, Value>::new()),
         }
     }
+
+    /// The context for rendering a *dependency's* `packages.yml`.
+    ///
+    /// A just-installed package's own `packages.yml` is rendered and then
+    /// installed from, so with the root context it could read any environment
+    /// variable of the machine running `dbt deps` (and route it into a
+    /// `local:` path, a `git:` revision or a `tarball:` URL). Only the root
+    /// project's `packages.yml` is the user's own; a dependency's gets no
+    /// `env_var`.
+    pub fn restricted(vars: BTreeMap<String, dbt_yaml::Value>) -> Self {
+        Self {
+            env_var: Value::from_func_func("env_var", |_state, _args| {
+                Err(minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    "env_var is not available when rendering a dependency's packages.yml; \
+                     only the root project's packages.yml may read environment variables",
+                ))
+            }),
+            var: Value::from_object(Var::new(vars)),
+            target: Value::from_serialize(BTreeMap::<String, Value>::new()),
+        }
+    }
 }
