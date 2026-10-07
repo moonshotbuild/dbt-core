@@ -4,6 +4,7 @@ use dbt_common::path::DbtPath;
 use dbt_common::tracing::dbt_emit::emit_warn_log_message;
 use dbt_jinja_utils::jinja_environment::JinjaEnv;
 use indexmap::IndexMap;
+use minijinja::dispatch_object::get_internal_packages_for;
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
@@ -77,8 +78,53 @@ pub async fn load_packages(
         token,
     )
     .await?;
+    let reserved = get_internal_packages_for(
+        dbt_profile
+            .adapter_types()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .iter()
+            .map(String::as_str),
+    );
+    reject_reserved_package_names(&packages, &reserved)?;
     normalize_package_dependency_names(&mut packages);
     Ok(packages)
+}
+
+/// Refuse an installed package whose declared `name:` is one of dbt's own
+/// internal packages (`dbt`, `dbt_<adapter>` and the adapter's parents) or the
+/// root project's name.
+///
+/// Macro and materialization locality is decided from the package name, so a
+/// dependency calling itself `dbt_duckdb` was classified as a built-in: it
+/// survived the filter that reserves built-in materialization overrides to
+/// the root project and its materialization then built every root model.
+/// dbt Core 1.x refuses these names at load; this restores that.
+fn reject_reserved_package_names(packages: &[DbtPackage], reserved: &[String]) -> FsResult<()> {
+    let Some(root) = packages.first() else {
+        return Ok(());
+    };
+    for package in packages.iter().skip(1) {
+        let name = &package.dbt_project.name;
+        if reserved.iter().any(|r| r == name) {
+            return err!(
+                ErrorCode::InvalidConfig,
+                "Installed package at '{}' declares the reserved name '{}', which belongs to one of dbt's internal packages",
+                package.package_root_path.display(),
+                name
+            );
+        }
+        if name == &root.dbt_project.name {
+            return err!(
+                ErrorCode::InvalidConfig,
+                "Installed package at '{}' declares the same name as the root project ('{}')",
+                package.package_root_path.display(),
+                name
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Replace package installation names in dependency sets with the names declared by
@@ -120,6 +166,37 @@ mod package_dependency_name_tests {
             dependencies: dependencies.iter().map(|name| name.to_string()).collect(),
             ..Default::default()
         }
+    }
+
+    /// A dependency may not borrow an internal package's name or the root's
+    /// (advisory deps-internal-package-name-spoof).
+    #[test]
+    fn rejects_internal_and_root_package_names() {
+        let reserved = get_internal_packages_for(["duckdb"]);
+        let ok = vec![
+            package("root", "my_project", &[]),
+            package("pkg", "honest_pkg", &[]),
+        ];
+        assert!(reject_reserved_package_names(&ok, &reserved).is_ok());
+
+        for spoof in ["dbt", "dbt_duckdb", "my_project"] {
+            let packages = vec![
+                package("root", "my_project", &[]),
+                package("pkg", spoof, &[]),
+            ];
+            let err = reject_reserved_package_names(&packages, &reserved).unwrap_err();
+            assert!(err.to_string().contains(spoof), "{spoof}: {err}");
+        }
+
+        // Another adapter's package name is not reserved for this profile.
+        let other = vec![
+            package("root", "my_project", &[]),
+            package("pkg", "dbt_postgres", &[]),
+        ];
+        assert!(reject_reserved_package_names(&other, &reserved).is_ok());
+        // The root project itself may of course keep its own name.
+        let root_only = vec![package("root", "dbt_duckdb", &[])];
+        assert!(reject_reserved_package_names(&root_only, &reserved).is_ok());
     }
 
     #[test]
