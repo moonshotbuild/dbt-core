@@ -1,0 +1,11 @@
+kind: Security
+body: Refuse an installed package whose `name:` is one of dbt's internal package
+    names (`dbt`, `dbt_<adapter>` and its parents) or the root project's name, as
+    dbt Core 1.x does. Package locality was decided from the self-declared name, so
+    a dependency calling itself `dbt_<adapter>` was treated as a built-in and its
+    materialization silently replaced the built-in one for every root model.
+time: 2026-10-07T10:07:00.000000+08:00
+custom:
+    author: joshuataylor
+    issue: ""
+    project: dbt-core
