@@ -77,19 +77,29 @@ fn resolve_cloud_config_with_env_reader(
             .or_else(|| safe_project.map(|p| p.account_id.clone()))
     });
 
-    let token =
-        env_reader("DBT_CLOUD_TOKEN").or_else(|| safe_project.map(|p| p.token_value.clone()));
+    let env_token = env_reader("DBT_CLOUD_TOKEN");
+    let token_from_saved_config = env_token.is_none() && safe_project.is_some();
+    let token = env_token.or_else(|| safe_project.map(|p| p.token_value.clone()));
 
-    let host = env_reader("DBT_CLOUD_ACCOUNT_HOST").or_else(|| {
-        project_dbt_cloud
-            .and_then(|p| {
-                p.tenant_hostname
-                    .clone()
-                    .filter(|h| !h.is_empty())
-                    .or_else(|| p.account_host.clone())
-            })
-            .or_else(|| safe_project.map(|p| p.account_host.clone()))
+    let env_host = env_reader("DBT_CLOUD_ACCOUNT_HOST");
+    let project_file_host = project_dbt_cloud.and_then(|p| {
+        p.tenant_hostname
+            .clone()
+            .filter(|h| !h.is_empty())
+            .or_else(|| p.account_host.clone())
     });
+    // A project-file host paired with the saved token, pointing somewhere other
+    // than the host that token was saved for. See
+    // `ResolvedCloudConfig::host_overrides_saved_token`.
+    let host_overrides_saved_token = env_host.is_none()
+        && token_from_saved_config
+        && match (&project_file_host, safe_project) {
+            (Some(project_host), Some(saved)) => project_host != &saved.account_host,
+            _ => false,
+        };
+    let host = env_host
+        .or(project_file_host)
+        .or_else(|| safe_project.map(|p| p.account_host.clone()));
 
     // Build credentials only when all 3 required fields are present.
     let credentials = match (&account_id, &host, &token) {
@@ -141,6 +151,7 @@ fn resolve_cloud_config_with_env_reader(
         defer_job_id,
         state_org_id,
         job_id,
+        host_overrides_saved_token,
     };
 
     // Exhaustive match ensures new fields aren't forgotten.
@@ -154,6 +165,7 @@ fn resolve_cloud_config_with_env_reader(
         defer_job_id: None,
         state_org_id: None,
         job_id: None,
+        host_overrides_saved_token: _,
     } = &resolved
     {
         None
@@ -336,6 +348,53 @@ mod tests {
         let creds = r.credentials.unwrap();
         assert_eq!(creds.host, "proj-override.dbt.com");
         assert_eq!(creds.token, "secret");
+    }
+
+    /// A project-file host paired with the saved token is flagged, so the
+    /// artifact-ingest upload refuses to send that token there (advisory
+    /// cloud-artifact-host-override). The user's own overrides do not trip it.
+    #[test]
+    fn project_file_host_with_saved_token_is_flagged() {
+        let yml = cloud_yml("456", "cloud.getdbt.com", "secret");
+
+        // Project file names a different host, token comes from dbt_cloud.yml.
+        let pc = project_cloud(Some("456"), Some("attacker.example"), None, None);
+        let r = resolve_cloud_config_with_env_reader(Some(&yml), Some(&pc), env(&[])).unwrap();
+        assert!(r.host_overrides_saved_token);
+
+        // `tenant_hostname` takes the same route.
+        let mut pc_tenant = project_cloud(Some("456"), None, None, None);
+        pc_tenant.tenant_hostname = Some("attacker.example".to_string());
+        let r =
+            resolve_cloud_config_with_env_reader(Some(&yml), Some(&pc_tenant), env(&[])).unwrap();
+        assert!(r.host_overrides_saved_token);
+
+        // Same host as the saved one: nothing to flag.
+        let pc_same = project_cloud(Some("456"), Some("cloud.getdbt.com"), None, None);
+        let r = resolve_cloud_config_with_env_reader(Some(&yml), Some(&pc_same), env(&[])).unwrap();
+        assert!(!r.host_overrides_saved_token);
+
+        // The user's env host override wins and is their own choice.
+        let r = resolve_cloud_config_with_env_reader(
+            Some(&yml),
+            Some(&pc),
+            env(&[("DBT_CLOUD_ACCOUNT_HOST", "cloud.getdbt.com")]),
+        )
+        .unwrap();
+        assert!(!r.host_overrides_saved_token);
+
+        // An env token is not the saved token.
+        let r = resolve_cloud_config_with_env_reader(
+            Some(&yml),
+            Some(&pc),
+            env(&[("DBT_CLOUD_TOKEN", "env-token")]),
+        )
+        .unwrap();
+        assert!(!r.host_overrides_saved_token);
+
+        // No saved config at all: nothing to protect.
+        let r = resolve_cloud_config_with_env_reader(None, Some(&pc), env(&[]));
+        assert!(r.is_none_or(|r| !r.host_overrides_saved_token));
     }
 
     #[test]

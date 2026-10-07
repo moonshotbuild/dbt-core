@@ -1,0 +1,12 @@
+kind: Security
+body: Skip the artifact-ingest upload when `dbt_project.yml` names a dbt Cloud host
+    that differs from the one the saved `dbt_cloud.yml` token belongs to. The host
+    was taken from the project file independently of the project-id guard that gates
+    the token, so a checked-in project file could point the saved token's bearer at a
+    host of its choosing. `DBT_CLOUD_ACCOUNT_HOST` and `DBT_CLOUD_TOKEN` are the
+    user's own and still win.
+time: 2026-10-07T10:11:00.000000+08:00
+custom:
+    author: joshuataylor
+    issue: ""
+    project: dbt-core
