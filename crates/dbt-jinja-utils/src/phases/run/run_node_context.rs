@@ -11,6 +11,7 @@ use dbt_adapter_core::AdapterType;
 use dbt_agate::AgateTable;
 use dbt_common::ErrorCode;
 use dbt_common::io_args::IoArgs;
+use dbt_common::path::DbtPath;
 use dbt_common::serde_utils::convert_yml_to_value_map;
 
 use dbt_adapter::column::ColumnStatic;
@@ -387,6 +388,7 @@ fn build_run_node_overlay<S: Serialize>(
             &io_args.in_dir,
             &io_args.out_dir,
         ),
+        run_root: io_args.out_dir.clone(),
     });
 
     let load_agate_table = agate_table.map(|agate_table| {
@@ -611,7 +613,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("run/pkg/snapshots/my_snap.sql/my_snap.sql");
 
-        write_file(&path, "snapshot", "select 1").unwrap();
+        write_file(&path, dir.path(), "snapshot", "select 1").unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "select 1");
     }
@@ -628,7 +630,7 @@ mod tests {
         fs::write(&stale, "stale flat file").unwrap();
 
         let nested = stale.join("my_snap.sql");
-        write_file(&nested, "snapshot", "select 1").unwrap();
+        write_file(&nested, dir.path(), "snapshot", "select 1").unwrap();
 
         assert!(stale.is_dir());
         assert_eq!(fs::read_to_string(&nested).unwrap(), "select 1");
@@ -643,10 +645,42 @@ mod tests {
         fs::create_dir_all(target.join("my_model.sql").parent().unwrap()).unwrap();
         fs::write(target.join("my_model.sql"), "nested leftover").unwrap();
 
-        write_file(&target, "model", "select 1").unwrap();
+        write_file(&target, dir.path(), "model", "select 1").unwrap();
 
         assert!(target.is_file());
         assert_eq!(fs::read_to_string(&target).unwrap(), "select 1");
+    }
+
+    /// A run path that escapes the target directory (an alias of `../../x`,
+    /// or an absolute alias) is refused before anything is written or removed
+    /// (advisory compile-alias-path-write).
+    #[test]
+    fn write_file_refuses_a_path_outside_the_target_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("target");
+        fs::create_dir_all(root.join("run/pkg/models")).unwrap();
+        let sentinel = dir.path().join("sentinel.txt");
+        fs::write(&sentinel, "keep me").unwrap();
+
+        // Relative escape, with the sentinel sitting on the parent chain so the
+        // stale-file reconciliation would have deleted it.
+        let escaped = root.join("run/pkg/models/../../../../sentinel.txt/evil.sql");
+        let err = write_file(&escaped, &root, "model", "select 1").unwrap_err();
+        assert!(
+            err.to_string().contains("outside the target directory"),
+            "{err}"
+        );
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "keep me");
+
+        // Absolute escape.
+        let abs = dir.path().join("evil.sql");
+        assert!(write_file(&abs, &root, "model", "select 1").is_err());
+        assert!(!abs.exists());
+
+        // An honest path under the root still writes.
+        let ok = root.join("run/pkg/models/orders.sql");
+        write_file(&ok, &root, "model", "select 1").unwrap();
+        assert!(ok.is_file());
     }
 }
 
@@ -678,6 +712,11 @@ pub struct WriteConfig {
     pub resource_type: String,
     /// Absolute target/run path for this node.
     pub run_file_path: PathBuf,
+    /// The target directory every write must stay under. `run_file_path` is
+    /// built from the node's alias, which a model (or a package's
+    /// `generate_alias_name`) controls, so it is checked against this root
+    /// before anything is written or removed.
+    pub run_root: PathBuf,
 }
 
 impl Object for WriteConfig {
@@ -706,7 +745,12 @@ impl Object for WriteConfig {
         };
 
         // Write the file
-        match write_file(&self.run_file_path, &self.resource_type, payload) {
+        match write_file(
+            &self.run_file_path,
+            &self.run_root,
+            &self.resource_type,
+            payload,
+        ) {
             Ok(_) => {}
             Err(e) => {
                 return Err(Error::new(
@@ -721,13 +765,47 @@ impl Object for WriteConfig {
     }
 }
 
-/// Write a file to disk
-fn write_file(full_path: &Path, resource_type: &str, payload: &str) -> Result<(), Error> {
+/// Write a file to disk.
+///
+/// `full_path` must lie under `root` (the target directory) once `..`
+/// components are resolved: the path carries the node's alias, so an alias
+/// such as `../../x` or an absolute path would otherwise write -- and, via the
+/// stale-layout reconciliation below, delete -- outside the project.
+fn write_file(
+    full_path: &Path,
+    root: &Path,
+    resource_type: &str,
+    payload: &str,
+) -> Result<(), Error> {
     // Check if model is a Macro or SourceDefinition
     if resource_type == "macro" || resource_type == "source" {
         return Err(Error::new(
             ErrorKind::InvalidOperation,
             "Macros and sources cannot be written to disk",
+        ));
+    }
+
+    let normalized = DbtPath::absolute(full_path).map_err(|e| {
+        Error::new(
+            ErrorKind::InvalidOperation,
+            format!("Failed to resolve {}: {}", full_path.display(), e),
+        )
+    })?;
+    let root = DbtPath::absolute(root).map_err(|e| {
+        Error::new(
+            ErrorKind::InvalidOperation,
+            format!("Failed to resolve {}: {}", root.display(), e),
+        )
+    })?;
+    if !normalized.as_path().starts_with(root.as_path()) {
+        return Err(Error::new(
+            ErrorKind::InvalidOperation,
+            format!(
+                "Refusing to write {}: the path resolves outside the target directory {} \
+                 (is the node's alias a path?)",
+                full_path.display(),
+                root.as_path().display()
+            ),
         ));
     }
 
