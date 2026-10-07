@@ -116,7 +116,7 @@ pub async fn clean_project(
 
     let all_safe = paths_to_delete.iter().all(|path_to_delete| {
         // The clean command does not delete anything outside of the project directory
-        unrelated_paths(&arg.io.in_dir, path_to_delete)
+        inside_project(&arg.io.in_dir, path_to_delete)
             // The clean command does not delete protected directories ("models", "macros", etc.)
             && protected_paths
                 .iter()
@@ -198,6 +198,30 @@ pub async fn clean_project(
     Ok(())
 }
 
+/// Whether `path` (already absolute and `..`-collapsed) is strictly inside
+/// the project directory.
+///
+/// This used to be `unrelated_paths(in_dir, path)`, which only checks that
+/// `path` is not an ancestor of the project: the relative route from `path`
+/// back to the project starting with `..` was taken as "safe", but a sibling
+/// such as `clean-targets: ["../outside"]` satisfies that too, and
+/// `DbtPath::absolute` had already collapsed the `..` -- so `dbt clean`
+/// deleted a directory outside the project.
+fn inside_project<P: AsRef<Path>, Q: AsRef<Path>>(in_dir: P, path: Q) -> bool {
+    let contained = DbtPath::absolute(in_dir.as_ref()).is_ok_and(|root| {
+        path.as_ref().starts_with(root.as_path()) && path.as_ref() != root.as_path()
+    });
+    if !contained {
+        emit_error_log_from_fs_error(*fs_err!(
+            ErrorCode::InvalidPath,
+            "Refusing to clean '{}': it is not inside the project directory {}",
+            path.as_ref().display(),
+            in_dir.as_ref().display()
+        ));
+    }
+    contained
+}
+
 fn unrelated_paths<P: AsRef<Path>, Q: AsRef<Path>>(to: P, from: Q) -> bool {
     match stdfs::diff_paths(&to, &from).and_then(|diff| {
         // It is safe to delete a directory if the only way to get to a protected directory is to navigate to the parent.
@@ -216,5 +240,29 @@ fn unrelated_paths<P: AsRef<Path>, Q: AsRef<Path>>(to: P, from: Q) -> bool {
             emit_error_log_from_fs_error(*e);
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `clean-targets: ["../outside"]` must not be cleanable (advisory
+    /// clean-targets-delete-outside).
+    #[test]
+    fn inside_project_rejects_siblings_and_the_project_itself() {
+        let in_dir = Path::new("/proj");
+        let abs = |p: &str| DbtPath::absolute(in_dir.join(p)).unwrap();
+        assert!(inside_project(in_dir, abs("target")));
+        assert!(inside_project(in_dir, abs("dbt_packages")));
+        assert!(inside_project(in_dir, abs("target/../logs")));
+        assert!(!inside_project(in_dir, abs("../outside")));
+        assert!(!inside_project(in_dir, abs("target/../../outside")));
+        assert!(!inside_project(in_dir, abs("..")));
+        assert!(!inside_project(in_dir, abs(".")));
+        assert!(!inside_project(
+            in_dir,
+            DbtPath::absolute("/project2").unwrap()
+        ));
     }
 }
