@@ -1,0 +1,13 @@
+kind: Security
+body: Sanitise project-authored markdown in the docs site. Descriptions and `{% docs %}`
+    blocks were rendered with raw HTML enabled and no sanitiser, so a description in
+    any installed package was stored cross-site scripting (a `<script>`, an
+    `<iframe srcdoc>` or an event handler ran in the browser of whoever opened the
+    docs). Raw HTML now passes through an allow-list that keeps formatting markup and
+    drops anything that executes, and the docs server sends a Content-Security-Policy
+    that forbids frames, plugins and `<base>` retargeting.
+time: 2026-10-07T10:10:00.000000+08:00
+custom:
+    author: joshuataylor
+    issue: ""
+    project: dbt-core

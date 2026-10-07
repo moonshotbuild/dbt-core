@@ -52,9 +52,22 @@ pub(crate) fn asset_response(path: &str, bytes: Vec<u8>, content_type: Option<&s
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, mime)
+        .header(header::CONTENT_SECURITY_POLICY, CONTENT_SECURITY_POLICY)
         .body(Body::from(bytes))
         .expect("valid asset response")
 }
+
+/// Sent with every asset the docs server serves.
+///
+/// Deliberately narrow: the app loads its DuckDB-WASM runtime from a CDN and
+/// runs it in workers, so a `script-src` / `connect-src` policy would need the
+/// whole app exercised in a browser to get right. These three directives cost
+/// nothing the app uses and close the vectors a project-authored description
+/// could still reach if the markdown sanitiser were bypassed: no frames (the
+/// `<iframe srcdoc>` route), no plugins, and no `<base>` retargeting of every
+/// relative URL on the page.
+pub(crate) const CONTENT_SECURITY_POLICY: &str =
+    "frame-src 'none'; object-src 'none'; base-uri 'self'";
 
 #[cfg(feature = "embed-ui")]
 pub use crate::embed::serve_assets;
@@ -161,6 +174,25 @@ pub async fn serve_assets(_uri: Uri) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn asset_responses_carry_the_content_security_policy() {
+        let response = asset_response("index.html", b"<html></html>".to_vec(), None);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .and_then(|v| v.to_str().ok()),
+            Some(CONTENT_SECURITY_POLICY)
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/html")
+        );
+    }
 
     #[cfg(feature = "embed-ui")]
     #[test]
