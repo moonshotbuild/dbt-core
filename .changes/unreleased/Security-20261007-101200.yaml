@@ -1,0 +1,10 @@
+kind: Security
+body: The `packages-install-path` containment check also resolves symlinks. A symlink
+    inside the project (`project/link -> /outside`) made `link/pkgs` pass the lexical
+    check while naming a directory outside the project, which `dbt deps` then removed
+    wholesale and recreated.
+time: 2026-10-07T10:12:00.000000+08:00
+custom:
+    author: joshuataylor
+    issue: ""
+    project: dbt-core
