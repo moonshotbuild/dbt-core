@@ -1,0 +1,11 @@
+kind: Security
+body: Require a resource name to be a single name, not a path, and refuse to write
+    synthesised snapshot SQL outside the target directory. A dependency's snapshot
+    properties `name:` of `../../macros/x` was joined onto `target/snapshots` with no
+    check on `dbt parse`, planting a macro in the root project that ran on the next
+    compile.
+time: 2026-10-07T10:04:00.000000+08:00
+custom:
+    author: joshuataylor
+    issue: ""
+    project: dbt-core
