@@ -1,0 +1,9 @@
+kind: Security
+body: Pass `--` to `git fetch` and `git ls-remote` so a package's git URL or revision
+    can no longer be parsed as a git option (a `revision` of `--upload-pack=<cmd>` ran
+    `<cmd>` during `dbt deps`), and reject URLs and revisions that begin with `-`.
+time: 2026-10-07T10:00:00.000000+08:00
+custom:
+    author: joshuataylor
+    issue: ""
+    project: dbt-core
