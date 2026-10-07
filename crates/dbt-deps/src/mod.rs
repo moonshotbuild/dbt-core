@@ -34,8 +34,9 @@ use dbt_telemetry::{DepsAllPackagesInstalled, GenericOpExecuted};
 use std::sync::Arc;
 use std::{collections::BTreeMap, path::Path};
 use steps::{
-    SkillInstallInputs, compute_package_lock, install_packages, install_skills, load_dbt_packages,
-    load_dbt_packages_lock_without_validation, try_load_valid_dbt_packages_lock,
+    SkillInstallInputs, compute_package_lock, ensure_inside_project, install_packages,
+    install_skills, load_dbt_packages, load_dbt_packages_lock_without_validation,
+    try_load_valid_dbt_packages_lock,
 };
 use tracing::Instrument as _;
 
@@ -64,6 +65,7 @@ pub async fn get_or_install_packages(
     cloud_config: Option<ResolvedCloudConfig>,
     ai_provider: Option<&[String]>,
 ) -> FsResult<(DbtPackagesLock, Vec<UpstreamProject>)> {
+    ensure_inside_project(packages_install_path, &io.in_dir)?;
     let Some(packages_relative_dir) =
         DbtPath::from(packages_install_path).get_relative_path(&io.in_dir)
     else {
