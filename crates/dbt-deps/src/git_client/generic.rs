@@ -200,15 +200,21 @@ async fn checkout_revision(
         .await;
     }
 
-    run_git(&["fetch", "--depth=1", repo, revision], Some(clone_dir))
-        .await
-        .map_err(|e| match e {
-            GitErr::Io(e) => fs_err!(ErrorCode::GitError, "Error fetching: {e}"),
-            GitErr::Failed { stderr } => {
-                let (code, msg) = parse_git_clone_error(&stderr, repo, Some(revision));
-                fs_err!(code, "{}", msg)
-            }
-        })?;
+    // `--` ends option parsing: the URL and revision are caller-controlled
+    // (a package's `packages.yml`), and without it a revision such as
+    // `--upload-pack=<cmd>` is parsed by git as an option and executed.
+    run_git(
+        &["fetch", "--depth=1", "--", repo, revision],
+        Some(clone_dir),
+    )
+    .await
+    .map_err(|e| match e {
+        GitErr::Io(e) => fs_err!(ErrorCode::GitError, "Error fetching: {e}"),
+        GitErr::Failed { stderr } => {
+            let (code, msg) = parse_git_clone_error(&stderr, repo, Some(revision));
+            fs_err!(code, "{}", msg)
+        }
+    })?;
 
     run_git(&["checkout", "FETCH_HEAD"], Some(clone_dir))
         .await
@@ -239,7 +245,8 @@ async fn checkout_revision(
 /// Resolve a ref to its 40-char SHA via `git ls-remote`. No rate limit.
 async fn ls_remote_resolve(repo_url: &str, revision: &str) -> FsResult<String> {
     let sanitized = crate::utils::sanitize_git_url(repo_url);
-    let stdout = run_git(&["ls-remote", repo_url, revision], None)
+    // `--` ends option parsing (see `checkout_revision`).
+    let stdout = run_git(&["ls-remote", "--", repo_url, revision], None)
         .await
         .map_err(|e| match e {
             GitErr::Io(e) => fs_err!(ErrorCode::GitError, "git ls-remote failed: {e}"),
@@ -261,4 +268,41 @@ async fn ls_remote_resolve(repo_url: &str, revision: &str) -> FsResult<String> {
         ErrorCode::PackageDownloadFailed,
         "Could not resolve ref '{revision}' via ls-remote"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A revision shaped like a git option must never reach git as one.
+    /// Before the `--` separator, `git fetch <url> --upload-pack=<cmd>` ran
+    /// `<cmd>` on the machine running `dbt deps`.
+    #[tokio::test]
+    async fn fetch_does_not_execute_an_option_shaped_revision() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let marker = tmp.path().join("MARKER");
+        let clone_dir = tmp.path().join("clone");
+        let revision = format!("--upload-pack=touch {};false", marker.display());
+
+        let result =
+            checkout_revision("file:///nonexistent/repo.git", &clone_dir, &revision, None).await;
+
+        assert!(result.is_err(), "fetch of a bogus repo must fail");
+        assert!(
+            !marker.exists(),
+            "the option-shaped revision was executed as a git option"
+        );
+    }
+
+    #[tokio::test]
+    async fn ls_remote_does_not_execute_an_option_shaped_revision() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let marker = tmp.path().join("MARKER");
+        let revision = format!("--upload-pack=touch {};false", marker.display());
+
+        let result = ls_remote_resolve("file:///nonexistent/repo.git", &revision).await;
+
+        assert!(result.is_err());
+        assert!(!marker.exists());
+    }
 }
