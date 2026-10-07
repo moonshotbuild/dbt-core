@@ -60,11 +60,48 @@ impl PrivatePackageResolver for LocalPrivatePackageResolver {
     }
 }
 
+/// Check a `private:` slug before it is interpolated into an SSH clone URL.
+///
+/// The slug is a package's own value (root or transitive `packages.yml`) and
+/// lands verbatim in `git@<host>:<slug>.git`. Require `org/repo` for GitHub,
+/// `org/[group/...]/repo` for GitLab and `org/project/repo` for Azure DevOps,
+/// every segment drawn from `[A-Za-z0-9._-]`, non-empty, not `.`/`..`, and
+/// not starting with `-` (which git would read as an option).
+fn validate_private_slug(slug: &str, provider: &str) -> FsResult<()> {
+    let parts: Vec<&str> = slug.split('/').collect();
+    let count_ok = match provider {
+        "github" => parts.len() == 2,
+        "gitlab" => parts.len() >= 2,
+        "ado" | "azure_devops" => parts.len() == 3,
+        _ => true,
+    };
+    let segment_ok = |seg: &str| {
+        !seg.is_empty()
+            && seg != "."
+            && seg != ".."
+            && !seg.starts_with('-')
+            && seg
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    };
+    if !count_ok || !parts.iter().all(|seg| segment_ok(seg)) {
+        return err!(
+            ErrorCode::InvalidConfig,
+            "Invalid private package '{}' for provider '{}': expected org/repo-style segments of letters, digits, '.', '_' and '-'",
+            slug,
+            provider
+        );
+    }
+    Ok(())
+}
+
 impl LocalPrivatePackageResolver {
     /// Resolves a private package definition to its local (SSH) Git clone URL.
     fn get_resolved_url(&self, private_package: &PrivatePackageRef) -> FsResult<String> {
         // Default to "github" when provider is unspecified, matching dbt-core's behavior
-        match private_package.provider.as_deref().unwrap_or("github") {
+        let provider = private_package.provider.as_deref().unwrap_or("github");
+        validate_private_slug(private_package.private_def.deref(), provider)?;
+        match provider {
             "github" => Ok(format!(
                 "git@github.com:{}.git",
                 private_package.private_def.deref()
@@ -156,5 +193,28 @@ impl PrivateDefinition {
 
     pub fn is_repo_wildcard(&self) -> bool {
         self.repo_name == "{repo}"
+    }
+}
+
+#[cfg(test)]
+mod slug_tests {
+    use super::validate_private_slug;
+
+    #[test]
+    fn validate_private_slug_accepts_slugs_and_rejects_injection() {
+        assert!(validate_private_slug("dbt-labs/dbt_utils", "github").is_ok());
+        assert!(validate_private_slug("org/sub.group/repo", "gitlab").is_ok());
+        assert!(validate_private_slug("org/project/repo", "ado").is_ok());
+        assert!(validate_private_slug("org/project/repo", "azure_devops").is_ok());
+
+        assert!(validate_private_slug("org/project/repo", "github").is_err());
+        assert!(validate_private_slug("org/repo", "ado").is_err());
+        assert!(validate_private_slug("org", "github").is_err());
+        assert!(validate_private_slug("org//repo", "github").is_err());
+        assert!(validate_private_slug("org/../repo", "github").is_err());
+        assert!(validate_private_slug("-c/repo", "github").is_err());
+        assert!(validate_private_slug("org/repo.git;x", "github").is_err());
+        assert!(validate_private_slug("org/repo x", "github").is_err());
+        assert!(validate_private_slug("org/re:po", "github").is_err());
     }
 }

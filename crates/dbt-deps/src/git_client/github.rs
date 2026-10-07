@@ -121,6 +121,42 @@ fn require_parts(parsed: &ParsedGitUrl) -> FsResult<&super::GitUrlParts> {
 // Archive download
 // ============================================================================
 
+/// Characters left as-is in the archive URL's revision segment: the URL
+/// unreserved set plus `/`, so `refs/heads/<branch>` and `refs/tags/<tag>`
+/// still address GitHub's archive endpoint. Everything else -- `?`, `#`, `%`,
+/// whitespace, control characters -- is percent-encoded, so a package's
+/// `revision` can only ever name a ref, never change the request.
+const REVISION_SEGMENT: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~')
+    .remove(b'/');
+
+/// The GitHub archive URL for `owner/repo` at `revision`.
+///
+/// `owner` and `repo` were already checked against GitHub's name character
+/// set by `can_handle`; `revision` is a package's own value and is encoded
+/// here. A `..` segment is refused outright rather than encoded.
+fn archive_url(owner: &str, repo: &str, revision: &str) -> FsResult<String> {
+    if !is_gh_repo_valid_name(owner) || !is_gh_repo_valid_name(repo) {
+        return Err(fs_err!(
+            ErrorCode::InvalidConfig,
+            "Invalid GitHub repository '{owner}/{repo}'"
+        ));
+    }
+    if revision.is_empty() || revision.split('/').any(|seg| seg.is_empty() || seg == "..") {
+        return Err(fs_err!(
+            ErrorCode::InvalidConfig,
+            "Invalid git revision '{revision}': must name a ref"
+        ));
+    }
+    let revision = percent_encoding::utf8_percent_encode(revision, REVISION_SEGMENT);
+    Ok(format!(
+        "https://github.com/{owner}/{repo}/archive/{revision}.tar.gz"
+    ))
+}
+
 async fn download_archive(
     tarball_client: &TarballClient,
     owner: &str,
@@ -130,10 +166,7 @@ async fn download_archive(
     subdirectory: Option<&str>,
     auth_token: Option<&str>,
 ) -> FsResult<()> {
-    let archive_url = format!(
-        "https://github.com/{}/{}/archive/{}.tar.gz",
-        owner, repo, revision
-    );
+    let archive_url = archive_url(owner, repo, revision)?;
 
     let auth_header = github_token_for_request(auth_token).map(|t| format!("Bearer {}", t));
     let headers: Vec<(&str, &str)> = auth_header
@@ -256,6 +289,33 @@ async fn fire_graphql(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A package's `revision` is interpolated into the archive URL; it must
+    /// only ever name a ref (advisory deps-git-url-interpolation).
+    #[test]
+    fn archive_url_encodes_the_revision_and_refuses_traversal() {
+        let url = |rev: &str| archive_url("dbt-labs", "dbt-utils", rev);
+        assert_eq!(
+            url("v1.0.0").unwrap(),
+            "https://github.com/dbt-labs/dbt-utils/archive/v1.0.0.tar.gz"
+        );
+        assert_eq!(
+            url("refs/heads/feature-x").unwrap(),
+            "https://github.com/dbt-labs/dbt-utils/archive/refs/heads/feature-x.tar.gz"
+        );
+        assert_eq!(
+            url("main?x=1#frag").unwrap(),
+            "https://github.com/dbt-labs/dbt-utils/archive/main%3Fx%3D1%23frag.tar.gz"
+        );
+        assert_eq!(
+            url("a b%c").unwrap(),
+            "https://github.com/dbt-labs/dbt-utils/archive/a%20b%25c.tar.gz"
+        );
+        assert!(url("../../../other/repo/archive/main").is_err());
+        assert!(url("").is_err());
+        assert!(url("a//b").is_err());
+        assert!(archive_url("evil\"org", "repo", "main").is_err());
+    }
 
     #[test]
     fn is_gh_repo_valid_name_accepts_github_char_classes() {

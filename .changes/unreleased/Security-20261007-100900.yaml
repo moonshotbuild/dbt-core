@@ -1,0 +1,10 @@
+kind: Security
+body: Percent-encode a package's `revision` in the GitHub archive URL (refusing `..`
+    segments) and validate a `private:` slug's shape before it is interpolated into
+    an SSH clone URL. Both were inserted raw, so a package could change the request
+    rather than only name a ref or repository.
+time: 2026-10-07T10:09:00.000000+08:00
+custom:
+    author: joshuataylor
+    issue: ""
+    project: dbt-core
