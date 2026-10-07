@@ -133,7 +133,7 @@ pub async fn clean_project(
                 // `inside_project` and `unrelated_paths` only collapse `..` without checking for a symlink, so a symlink in the project can route the real delete outside the project or onto a protected directory.
                 // Re-check on the canonical paths before leasing, and fail closed.
                 // (Checked again right before the delete: the lease waits below can be long.)
-                canonical_safe_to_delete(&arg.io.in_dir, path, &protected_paths)?;
+                report_canonical_refusal(&arg.io.in_dir, path, &protected_paths)?;
                 if path.eq(&default_target_dir) {
                     // We have already acquired the lease for this directory at this point.
                     lease_guards.push((
@@ -178,7 +178,7 @@ pub async fn clean_project(
             // pathname check cannot close the window completely (only a delete
             // anchored to a validated directory handle could), but it narrows it
             // to the instant before `remove_dir_all` opens the target.
-            canonical_safe_to_delete(&arg.io.in_dir, path, &protected_paths)?;
+            report_canonical_refusal(&arg.io.in_dir, path, &protected_paths)?;
             emit_info_progress_message(ProgressMessage::new_from_action_and_target(
                 "Removing".to_string(),
                 display_path_string.to_string(),
@@ -231,6 +231,30 @@ fn inside_project<P: AsRef<Path>, Q: AsRef<Path>>(in_dir: P, path: Q) -> bool {
         ));
     }
     contained
+}
+
+/// [`canonical_safe_to_delete`], with the refusal emitted as an error before it
+/// is returned. `clean_project`'s caller exits non-zero on a returned error but
+/// never prints it, so without this the user saw `Finished 'clean'
+/// successfully` and no deletion, with no explanation -- `inside_project`
+/// emits its refusal the same way.
+fn report_canonical_refusal<P: AsRef<Path>, Q: AsRef<Path>>(
+    in_dir: P,
+    path: Q,
+    protected_paths: &[DbtPath],
+) -> FsResult<()> {
+    let path = path.as_ref();
+    match canonical_safe_to_delete(in_dir, path, protected_paths) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            emit_error_log_from_fs_error(*e);
+            err!(
+                ErrorCode::InvalidPath,
+                "Refusing to clean '{}'",
+                path.display()
+            )
+        }
+    }
 }
 
 /// Check an existing delete target against the project root and the protected directories using canonical paths.
