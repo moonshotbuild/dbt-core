@@ -1,0 +1,10 @@
+kind: Security
+body: The `target/run` write guard also resolves symlinks. A symlinked directory under
+    `target/` let a valid alias write outside the target directory, and the
+    stale-layout reconciliation delete there; a symlink at the output file itself was
+    followed by the write. Both are refused now.
+time: 2026-10-07T10:13:00.000000+08:00
+custom:
+    author: joshuataylor
+    issue: ""
+    project: dbt-core
