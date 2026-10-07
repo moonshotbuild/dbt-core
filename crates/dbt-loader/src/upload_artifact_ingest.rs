@@ -163,6 +163,23 @@ fn is_truthy_env_var(var_name: &str) -> bool {
 }
 
 fn resolve_upload_config(dbt_cloud_config: &Option<ResolvedCloudConfig>) -> Option<UploadConfig> {
+    // The ingest request carries the Cloud token as a bearer. Refuse to send
+    // it to a host the project file chose when the token was saved for a
+    // different one: `dbt_project.yml` is checked in and may not be the
+    // user's own, and this is the one request where a project-supplied host
+    // meets a saved credential.
+    if dbt_cloud_config
+        .as_ref()
+        .is_some_and(|c| c.host_overrides_saved_token)
+    {
+        emit_skip_warning(
+            ErrorCode::InvalidConfig,
+            "Skipping artifact ingest upload: dbt_project.yml names a dbt Cloud host that \
+             differs from the one the saved token belongs to. Set DBT_CLOUD_ACCOUNT_HOST \
+             (or DBT_CLOUD_TOKEN) explicitly if that host is intended.",
+        );
+        return None;
+    }
     let creds = dbt_cloud_config
         .as_ref()
         .and_then(|c| c.credentials.as_ref());
@@ -609,7 +626,21 @@ mod tests {
             defer_job_id: None,
             state_org_id: None,
             job_id: None,
+            host_overrides_saved_token: false,
         })
+    }
+
+    /// The ingest upload never pairs the saved token with a host the project
+    /// file chose (advisory cloud-artifact-host-override).
+    #[test]
+    fn test_resolve_upload_config_refuses_a_project_file_host_override() {
+        let mut cloud_config = sample_upload_cloud_config();
+        cloud_config.as_mut().unwrap().host_overrides_saved_token = true;
+
+        assert!(resolve_upload_config(&cloud_config).is_none());
+
+        cloud_config.as_mut().unwrap().host_overrides_saved_token = false;
+        assert!(resolve_upload_config(&cloud_config).is_some());
     }
 
     #[test]
