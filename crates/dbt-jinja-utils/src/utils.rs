@@ -2,7 +2,9 @@ use dbt_adapter::Adapter;
 use dbt_adapter::relation::render_effective_relation;
 use dbt_adapter_core::AdapterType;
 use dbt_common::{ErrorCode, FsError, fs_err};
-use dbt_common::{FsResult, constants::DBT_CTE_PREFIX, error::MacroSpan, io_utils::ScratchFs, stdfs};
+use dbt_common::{
+    FsResult, constants::DBT_CTE_PREFIX, error::MacroSpan, io_utils::ScratchFs, stdfs,
+};
 use dbt_frontend_common::{error::CodeLocation, span::Span};
 use dbt_schemas::schemas::common::ResolvedQuoting;
 use dbt_schemas::schemas::project::ResolvableConfig;
@@ -165,6 +167,35 @@ pub fn unescape(html: &str) -> String {
     String::from_utf8_lossy(&output).into_owned()
 }
 
+/// Reject a model name or alias that cannot be used as a single file-name
+/// component of the ephemeral scratch path.
+///
+/// The ephemeral path is `<target>/ephemeral/<name>.sql`, where `<name>` is
+/// the node's alias -- set by the model (or any package's
+/// `generate_alias_name`), so an alias such as `../../outside` or an absolute
+/// path would write outside `target/`. A legitimate alias is a relation
+/// identifier and never contains a path separator, `..`, or a NUL.
+pub fn validate_path_component(name: &str, what: &str) -> FsResult<()> {
+    let bad = name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+        || Path::new(name).is_absolute()
+        || Path::new(name).has_root()
+        || (name.len() >= 2
+            && name.as_bytes()[1] == b':'
+            && name.as_bytes()[0].is_ascii_alphabetic());
+    if bad {
+        return Err(fs_err!(
+            ErrorCode::InvalidConfig,
+            "Invalid {what} '{name}': must be a single file name, not a path"
+        ));
+    }
+    Ok(())
+}
+
 /// Handles ephemeral model CTEs in SQL
 ///
 /// This function processes SQL that contains DBT CTE prefixes, extracts model names,
@@ -178,6 +209,8 @@ pub fn inject_and_persist_ephemeral_models(
     ephemeral_dir: &Path,
     scratch_fs: Option<&Arc<dyn ScratchFs>>,
 ) -> FsResult<String> {
+    validate_path_component(model_name, "model alias")?;
+
     // Write the ephemeral model's SQL for `path`, to the injected in-memory
     // `ScratchFs` when one is set, else to disk (creating the dir).
     let persist = |path: &Path, contents: String| -> FsResult<()> {
@@ -211,6 +244,7 @@ pub fn inject_and_persist_ephemeral_models(
     let mut all_ctes = Vec::new();
 
     for model_name in ephemeral_model_names {
+        validate_path_component(model_name, "ephemeral model name")?;
         let ephemeral_path = ephemeral_dir.join(format!("{model_name}.sql"));
         let ephemeral_sql = match scratch_fs.and_then(|fs| fs.read(&ephemeral_path)) {
             Some(ephemeral_sql) => ephemeral_sql,
@@ -912,8 +946,9 @@ mod tests {
     use crate::listener::DefaultRenderingEventListener;
 
     use super::{
-        find_macro_template, inject_ctes_into_existing_with, raw_source_spans_to_macro_span_vec,
-        shift_macro_spans_after_insertion,
+        find_macro_template, inject_and_persist_ephemeral_models, inject_ctes_into_existing_with,
+        raw_source_spans_to_macro_span_vec, shift_macro_spans_after_insertion,
+        validate_path_component,
     };
     use crate::jinja_environment::JinjaEnv;
 
@@ -1120,5 +1155,73 @@ mod tests {
                 span.macro_span.start.line == 2 && span.expanded_span.start.line == 2
             })
         );
+    }
+
+    #[test]
+    fn validate_path_component_accepts_identifiers_and_rejects_paths() {
+        for ok in ["orders", "stg_orders_v2", "my-model", "a.b", "Ünïcode"] {
+            assert!(validate_path_component(ok, "alias").is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../outside",
+            "a/b",
+            "a\\b",
+            "/tmp/x",
+            "C:\\x",
+            "nul\0byte",
+        ] {
+            assert!(validate_path_component(bad, "alias").is_err(), "{bad:?}");
+        }
+    }
+
+    /// An alias that is a path must not become an ephemeral scratch path
+    /// outside the ephemeral directory (advisory compile-alias-path-write).
+    #[test]
+    fn ephemeral_persist_refuses_a_path_shaped_alias() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ephemeral_dir = tmp.path().join("target").join("ephemeral");
+        let outside = tmp.path().join("outside.sql");
+        let mut spans = MacroSpans::default();
+
+        let err = inject_and_persist_ephemeral_models(
+            "select 1".to_string(),
+            &mut spans,
+            "../../outside",
+            true,
+            &ephemeral_dir,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("single file name"), "{err}");
+        assert!(!outside.exists());
+
+        let abs = tmp.path().join("abs_alias");
+        assert!(
+            inject_and_persist_ephemeral_models(
+                "select 1".to_string(),
+                &mut spans,
+                abs.to_str().unwrap(),
+                true,
+                &ephemeral_dir,
+                None,
+            )
+            .is_err()
+        );
+        assert!(!abs.with_extension("sql").exists());
+
+        // An honest alias still persists under the ephemeral dir.
+        inject_and_persist_ephemeral_models(
+            "select 1".to_string(),
+            &mut spans,
+            "stg_orders",
+            true,
+            &ephemeral_dir,
+            None,
+        )
+        .unwrap();
+        assert!(ephemeral_dir.join("stg_orders.sql").is_file());
     }
 }
