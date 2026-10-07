@@ -1,0 +1,11 @@
+kind: Security
+body: Render an installed dependency's `packages.yml` without `env_var`. It was
+    rendered with the same context as the root project's, so a transitive package
+    could read any environment variable of the machine running `dbt deps` and route
+    it into a `local:` path, `git:` revision or `tarball:` URL it then installed
+    from. Only the root `packages.yml` may read the environment now.
+time: 2026-10-07T10:08:00.000000+08:00
+custom:
+    author: joshuataylor
+    issue: ""
+    project: dbt-core
