@@ -1,0 +1,10 @@
+kind: Security
+body: '`dbt clean` only deletes directories strictly inside the project. The safety
+    check accepted any path that was not an ancestor of the project, so a
+    `clean-targets` entry of `../outside` (collapsed before the check) deleted a
+    directory next to the project.'
+time: 2026-10-07T10:06:00.000000+08:00
+custom:
+    author: joshuataylor
+    issue: ""
+    project: dbt-core
