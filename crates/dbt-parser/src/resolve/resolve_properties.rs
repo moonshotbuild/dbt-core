@@ -613,7 +613,30 @@ impl MinimalProperties {
     }
 }
 
+/// A resource name must be usable as a single file-name component: several
+/// resolve steps join `{name}.sql` onto a directory under `target/` (snapshot
+/// properties and generic tests among them), so a name carrying a path
+/// separator, `..`, a NUL or an absolute/drive prefix would write outside
+/// `target/` -- a dependency's `name: ../../macros/x` planted a macro in the
+/// root project. Spaces were already refused.
 fn validate_resource_name(name: &str) -> FsResult<String> {
+    let is_path = name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+        || Path::new(name).has_root()
+        || (name.len() >= 2
+            && name.as_bytes()[1] == b':'
+            && name.as_bytes()[0].is_ascii_alphabetic());
+    if is_path {
+        return Err(fs_err!(
+            ErrorCode::DbtYamlValidationError,
+            "Resource name '{}' must be a single name, not a path",
+            name
+        ));
+    }
     // Check for the space character for now. This can be extended anytime we deprecate
     // more of special characters like !@#%$":'
     if name.chars().any(|c| matches!(c, ' ')) {
@@ -625,6 +648,32 @@ fn validate_resource_name(name: &str) -> FsResult<String> {
         Err(err)
     } else {
         Ok(name.to_string())
+    }
+}
+
+#[cfg(test)]
+mod resource_name_tests {
+    use super::validate_resource_name;
+
+    #[test]
+    fn validate_resource_name_rejects_paths() {
+        for ok in ["orders", "stg_orders_v2", "my-snap", "a.b", "Ünïcode"] {
+            assert!(validate_resource_name(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../../macros/evil",
+            "a/b",
+            "a\\b",
+            "/tmp/evil",
+            "C:evil",
+            "nul\0byte",
+            "has space",
+        ] {
+            assert!(validate_resource_name(bad).is_err(), "{bad:?}");
+        }
     }
 }
 
