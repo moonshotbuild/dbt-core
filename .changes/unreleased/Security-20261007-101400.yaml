@@ -1,0 +1,11 @@
+kind: Security
+body: The artifact-ingest upload is skipped whenever the dbt Cloud host comes from
+    `dbt_project.yml` alone -- no `DBT_CLOUD_ACCOUNT_HOST`, and not the host the saved
+    `dbt_cloud.yml` project is bound to -- whichever way the token arrived. An
+    environment-supplied token (CI) previously disabled the guard, letting a
+    checked-in project choose where that token was sent.
+time: 2026-10-07T10:14:00.000000+08:00
+custom:
+    author: joshuataylor
+    issue: ""
+    project: dbt-core

@@ -164,19 +164,19 @@ fn is_truthy_env_var(var_name: &str) -> bool {
 
 fn resolve_upload_config(dbt_cloud_config: &Option<ResolvedCloudConfig>) -> Option<UploadConfig> {
     // The ingest request carries the Cloud token as a bearer. Refuse to send
-    // it to a host the project file chose when the token was saved for a
-    // different one: `dbt_project.yml` is checked in and may not be the
-    // user's own, and this is the one request where a project-supplied host
-    // meets a saved credential.
+    // it to a host chosen by the project file alone: `dbt_project.yml` is
+    // checked in and may not be the user's own, and this is the one request
+    // where a project-supplied host meets a credential -- saved or from the
+    // environment.
     if dbt_cloud_config
         .as_ref()
-        .is_some_and(|c| c.host_overrides_saved_token)
+        .is_some_and(|c| c.ingest_host_unverified)
     {
         emit_skip_warning(
             ErrorCode::InvalidConfig,
             "Skipping artifact ingest upload: dbt_project.yml names a dbt Cloud host that \
-             differs from the one the saved token belongs to. Set DBT_CLOUD_ACCOUNT_HOST \
-             (or DBT_CLOUD_TOKEN) explicitly if that host is intended.",
+             neither the environment nor the saved dbt_cloud.yml project confirms. Set \
+             DBT_CLOUD_ACCOUNT_HOST explicitly if that host is intended.",
         );
         return None;
     }
@@ -626,20 +626,20 @@ mod tests {
             defer_job_id: None,
             state_org_id: None,
             job_id: None,
-            host_overrides_saved_token: false,
+            ingest_host_unverified: false,
         })
     }
 
-    /// The ingest upload never pairs the saved token with a host the project
-    /// file chose (advisory cloud-artifact-host-override).
+    /// The ingest upload never sends a token to a host the project file alone
+    /// chose (advisory cloud-artifact-host-override).
     #[test]
-    fn test_resolve_upload_config_refuses_a_project_file_host_override() {
+    fn test_resolve_upload_config_refuses_an_unverified_project_file_host() {
         let mut cloud_config = sample_upload_cloud_config();
-        cloud_config.as_mut().unwrap().host_overrides_saved_token = true;
+        cloud_config.as_mut().unwrap().ingest_host_unverified = true;
 
         assert!(resolve_upload_config(&cloud_config).is_none());
 
-        cloud_config.as_mut().unwrap().host_overrides_saved_token = false;
+        cloud_config.as_mut().unwrap().ingest_host_unverified = false;
         assert!(resolve_upload_config(&cloud_config).is_some());
     }
 
