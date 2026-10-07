@@ -200,6 +200,24 @@ fn is_unpinned_git_revision(revision: &str, warn_unpinned: bool) -> bool {
     warn_unpinned && ["HEAD", "main", "master"].contains(&revision)
 }
 
+/// Reject a git URL or revision that git would read as an option.
+///
+/// Both values come from a package's `packages.yml`, and both are handed to
+/// `git fetch` / `git ls-remote` as positionals. The subprocess calls use a
+/// `--` separator, so this is defence in depth: a value beginning with `-`
+/// has no legitimate meaning as a repository or ref either way.
+fn validate_git_argument<'a>(value: &'a str, what: &str) -> Result<&'a str, String> {
+    if value.is_empty() {
+        return Err(format!("Invalid git {what}: must not be empty"));
+    }
+    if value.starts_with('-') {
+        return Err(format!(
+            "Invalid git {what} '{value}': must not begin with '-'",
+        ));
+    }
+    Ok(value)
+}
+
 /// Validate that a subdirectory path contains only normal components.
 fn validate_subdirectory(subdir: &str) -> Result<&str, String> {
     for component in Path::new(subdir).components() {
@@ -246,6 +264,9 @@ pub async fn download_git_like_package(
         .last()
         .map(|r| r.trim().to_string())
         .unwrap_or_else(|| "HEAD".to_string());
+    validate_git_argument(repo_url, "repository")
+        .and_then(|_| validate_git_argument(&revision, "revision"))
+        .map_err(|e| fs_err!(ErrorCode::InvalidConfig, "{}", e))?;
 
     let parsed = parse_git_url(repo_url);
     let outcome = get_git_client(&context.git_client, &parsed)
@@ -288,6 +309,9 @@ pub async fn install_git_like_package(
     // Trim: lockfile SHAs written as YAML block scalars (`revision: |`) carry
     // a trailing newline that `git fetch` rejects as an invalid refspec.
     let sha = sha.trim();
+    validate_git_argument(repo_url, "repository")
+        .and_then(|_| validate_git_argument(sha, "revision"))
+        .map_err(|e| fs_err!(ErrorCode::InvalidConfig, "{}", e))?;
     let parsed = parse_git_url(repo_url);
     let outcome = get_git_client(&context.git_client, &parsed)
         .install(&parsed, sha, download_dir, subdirectory.as_deref())
@@ -543,6 +567,16 @@ mod tests {
         assert!(is_commit("1234567890abcdef1234567890abcdef12345678"));
         assert!(!is_commit("v1.0.0"));
         assert!(!is_commit("main"));
+    }
+
+    #[test]
+    fn validate_git_argument_rejects_option_shaped_values() {
+        assert!(validate_git_argument("https://github.com/o/r", "repository").is_ok());
+        assert!(validate_git_argument("v1.0.0", "revision").is_ok());
+        assert!(validate_git_argument("HEAD", "revision").is_ok());
+        assert!(validate_git_argument("--upload-pack=touch /tmp/x", "revision").is_err());
+        assert!(validate_git_argument("-c", "revision").is_err());
+        assert!(validate_git_argument("", "revision").is_err());
     }
 
     #[test]
