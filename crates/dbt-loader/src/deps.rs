@@ -87,7 +87,7 @@ pub async fn execute_deps_command(
         &load_args.packages_install_path,
         &load_args.internal_packages_install_path,
         &simplified_dbt_project,
-    );
+    )?;
 
     // A minimal Jinja environment is sufficient for rendering any
     // `{{ env_var(...) }}` calls that may appear in packages.yml.

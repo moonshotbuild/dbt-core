@@ -7,7 +7,7 @@
 //! the project.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use dbt_common::cancellation::CancellationToken;
@@ -55,6 +55,10 @@ impl TestProject {
     }
 
     async fn try_deps(&self) -> Result<(), Box<dbt_common::FsError>> {
+        self.try_deps_into(&self.root.join("dbt_packages")).await
+    }
+
+    async fn try_deps_into(&self, install_path: &Path) -> Result<(), Box<dbt_common::FsError>> {
         let io = IoArgs {
             in_dir: self.root.clone(),
             out_dir: self.root.join("target"),
@@ -65,7 +69,7 @@ impl TestProject {
             &io,
             FsCommand::Deps,
             &env,
-            &self.root.join("dbt_packages"),
+            install_path,
             true,
             None,
             false,
@@ -126,4 +130,26 @@ async fn a_parent_traversing_package_name_is_refused() {
 
     assert!(err.to_string().contains("Invalid package name"), "{err}");
     assert!(!project.outside().exists());
+}
+
+/// `dbt deps` removes the install directory wholesale before reinstalling, so
+/// an install path outside the project must be refused before that deletion
+/// (advisory deps-packages-install-path-delete).
+#[tokio::test]
+async fn an_install_path_outside_the_project_is_refused_before_deletion() {
+    let project = TestProject::new();
+    project.with_local_package("pkg", "honest_pkg");
+    let outside = project.outside();
+    fs::create_dir_all(outside.join("important")).unwrap();
+    let sentinel = outside.join("important").join("keep.txt");
+    fs::write(&sentinel, "keep me").unwrap();
+
+    for escape in [outside.clone(), project.root.join("../outside")] {
+        let err = project
+            .try_deps_into(&escape)
+            .await
+            .expect_err("deps must refuse an install path outside the project");
+        assert!(err.to_string().contains("not inside the project"), "{err}");
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "keep me");
+    }
 }
