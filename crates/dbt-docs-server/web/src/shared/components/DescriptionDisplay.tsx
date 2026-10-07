@@ -2,8 +2,11 @@ import { FC } from 'react';
 import ReactMarkdown from 'react-markdown';
 import rehypeExternalLinks from 'rehype-external-links';
 import rehypeRaw from 'rehype-raw';
+import rehypeSanitize from 'rehype-sanitize';
 import remarkGfm from 'remark-gfm';
 import { twMerge } from 'tailwind-merge';
+
+import { markdownSanitizeSchema } from '../util/markdownSanitize';
 
 type DescriptionDisplayProps = {
   description: string | null | undefined;
@@ -28,7 +31,13 @@ export const DescriptionDisplay: FC<DescriptionDisplayProps> = ({
     <ReactMarkdown
       className={twMerge(BASE_CLASS, className)}
       remarkPlugins={[remarkGfm]}
-      rehypePlugins={[rehypeRaw, [rehypeExternalLinks, { target: '_blank' }]]}
+      // Raw HTML is parsed, then sanitised (the description may come from any
+      // installed package), then external links get their target.
+      rehypePlugins={[
+        rehypeRaw,
+        [rehypeSanitize, markdownSanitizeSchema],
+        [rehypeExternalLinks, { target: '_blank' }],
+      ]}
     >
       {description}
     </ReactMarkdown>
