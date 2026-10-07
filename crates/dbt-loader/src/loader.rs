@@ -355,7 +355,7 @@ pub async fn load(
         &arg.packages_install_path,
         &arg.internal_packages_install_path,
         &simplified_dbt_project,
-    );
+    )?;
 
     let adapter_type = dbt_state.dbt_profile.default_db_config().adapter_type();
     let arg_ref = &arg;
@@ -1424,40 +1424,59 @@ fn collect_paths(dbt_project: &DbtProject) -> HashMap<ResourcePathKind, Vec<Stri
     all_dirs
 }
 
-// returns (packages_install_path, internal_packages_install_path)
+/// Returns `(packages_install_path, internal_packages_install_path)`.
+///
+/// Both must stay inside the project. `dbt deps` removes the packages
+/// install directory wholesale before reinstalling into it, so a
+/// `packages-install-path` of `../OUTSIDE` or an absolute path in
+/// `dbt_project.yml` (or on the command line) deleted an arbitrary directory,
+/// even when the install then failed. The internal packages directory is
+/// derived from it and gets the same check.
 pub(crate) fn get_packages_install_path(
     in_dir: &Path,
     arg_packages_install_path: &Option<PathBuf>,
     arg_internal_packages_install_path: &Option<PathBuf>,
     dbt_project: &DbtProjectSimplified,
-) -> (PathBuf, PathBuf) {
-    let packages_install_path = if let Some(path) = arg_packages_install_path {
-        if path.is_absolute() {
-            path.clone()
-        } else {
-            in_dir.join(path)
-        }
+) -> FsResult<(PathBuf, PathBuf)> {
+    let (packages_install_path, source) = if let Some(path) = arg_packages_install_path {
+        (path.clone(), "--packages-install-path")
     } else if let Some(path) = &dbt_project.packages_install_path {
-        let mut path_buf = PathBuf::from(path);
-        if !path_buf.is_absolute() {
-            path_buf = in_dir.join(path_buf);
-        }
-        path_buf
+        (PathBuf::from(path), "packages-install-path")
     } else {
-        in_dir.join(DBT_PACKAGES_DIR_NAME)
+        (PathBuf::from(DBT_PACKAGES_DIR_NAME), "default")
     };
+    let packages_install_path = contained_install_path(in_dir, &packages_install_path, source)?;
 
     let internal_packages_install_path = if let Some(path) = arg_internal_packages_install_path {
-        if path.is_absolute() {
-            path.clone()
-        } else {
-            in_dir.join(path)
-        }
+        contained_install_path(in_dir, path, "--internal-packages-install-path")?
     } else {
         packages_install_path.with_file_name(DBT_INTERNAL_PACKAGES_DIR_NAME)
     };
 
-    (packages_install_path, internal_packages_install_path)
+    Ok((packages_install_path, internal_packages_install_path))
+}
+
+/// Resolve `path` against the project root and refuse it unless it stays
+/// inside the project once `..` components are collapsed.
+fn contained_install_path(in_dir: &Path, path: &Path, source: &str) -> FsResult<PathBuf> {
+    if path.is_absolute() {
+        return Err(fs_err!(
+            ErrorCode::InvalidConfig,
+            "Invalid {source} '{}': must be a path inside the project, not an absolute path",
+            path.display()
+        ));
+    }
+    let root = DbtPath::absolute(in_dir)?;
+    let resolved = DbtPath::absolute(in_dir.join(path))?;
+    if !resolved.as_path().starts_with(root.as_path()) || resolved.as_path() == root.as_path() {
+        return Err(fs_err!(
+            ErrorCode::InvalidConfig,
+            "Invalid {source} '{}': resolves outside the project directory {}",
+            path.display(),
+            in_dir.display()
+        ));
+    }
+    Ok(in_dir.join(path))
 }
 
 fn collect_profiles_yml_if_exists(
@@ -1588,6 +1607,45 @@ mod tests {
     use std::io::Write;
     use std::path::PathBuf;
     use std::time::SystemTime;
+
+    /// `packages-install-path` must stay inside the project: `dbt deps`
+    /// deletes it wholesale before reinstalling (advisory
+    /// deps-packages-install-path-delete).
+    #[test]
+    fn packages_install_path_must_stay_inside_the_project() {
+        let in_dir = std::env::temp_dir()
+            .join("dsk-install-path-test")
+            .join("project");
+        let project = |p: Option<&str>| -> DbtProjectSimplified {
+            let yml = match p {
+                Some(p) => format!("packages-install-path: \"{p}\"\n__ignored__: {{}}\n"),
+                None => "__ignored__: {}\n".to_string(),
+            };
+            dbt_yaml::from_str(&yml).expect("a minimal dbt_project.yml")
+        };
+
+        let (pkgs, internal) =
+            get_packages_install_path(&in_dir, &None, &None, &project(None)).unwrap();
+        assert_eq!(pkgs, in_dir.join(DBT_PACKAGES_DIR_NAME));
+        assert_eq!(internal, in_dir.join(DBT_INTERNAL_PACKAGES_DIR_NAME));
+
+        let (pkgs, _) =
+            get_packages_install_path(&in_dir, &None, &None, &project(Some("vendor/pkgs")))
+                .unwrap();
+        assert_eq!(pkgs, in_dir.join("vendor/pkgs"));
+
+        for bad in ["../OUTSIDE", "a/../../OUTSIDE", "/tmp/OUTSIDE", "."] {
+            let err =
+                get_packages_install_path(&in_dir, &None, &None, &project(Some(bad))).unwrap_err();
+            assert!(
+                err.to_string().contains("packages-install-path"),
+                "{bad}: {err}"
+            );
+        }
+        let cli = Some(PathBuf::from("../OUTSIDE"));
+        assert!(get_packages_install_path(&in_dir, &cli, &None, &project(None)).is_err());
+        assert!(get_packages_install_path(&in_dir, &None, &cli, &project(None)).is_err());
+    }
 
     #[test]
     fn resolve_threads_sets_profile_threads_from_target() {
