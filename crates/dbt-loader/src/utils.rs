@@ -1,5 +1,6 @@
 use dbt_common::io_args::IoArgs;
 use dbt_common::path::DbtPath;
+use dbt_common::tracing::dbt_emit::emit_warn_log_message;
 use dbt_common::{
     ErrorCode, FsResult,
     constants::{DBT_DEPENDENCIES_YML, DBT_PACKAGES_YML},
@@ -34,9 +35,47 @@ pub fn collect_file_info<P: AsRef<Path>, T: Fn(&Path) -> bool>(
     if !base_path.as_ref().exists() {
         return Ok(());
     }
+    // Every resource path (`model-paths`, `macro-paths`, ...) comes from a
+    // project's `dbt_project.yml` -- an installed package's included -- and is
+    // joined onto that project's root. `Path::join` discards the root for an
+    // absolute entry and walks out of it for `..`, which made a package's
+    // declared paths a way to read files anywhere on the machine. Refuse those
+    // outright, and skip (with a warning) a directory or file symlink whose
+    // canonical target is outside the project.
+    let canonical_base = std::fs::canonicalize(base_path.as_ref())?;
     for relative_path in relative_paths {
+        if Path::new(relative_path).is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Invalid resource path '{relative_path}' in {}: must be relative to the project, not absolute",
+                    base_path.as_ref().display()
+                ),
+            ));
+        }
         let full_path = base_path.as_ref().join(relative_path);
+        let normalized = DbtPath::absolute(&full_path)?;
+        let base_normalized = DbtPath::absolute(base_path.as_ref())?;
+        if !normalized.as_path().starts_with(base_normalized.as_path()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Invalid resource path '{relative_path}' in {}: resolves outside the project",
+                    base_path.as_ref().display()
+                ),
+            ));
+        }
         if !full_path.exists() {
+            continue;
+        }
+        if !std::fs::canonicalize(&full_path).is_ok_and(|c| c.starts_with(&canonical_base)) {
+            emit_warn_log_message(
+                ErrorCode::InvalidPath,
+                format!(
+                    "Skipping resource path '{relative_path}' in {}: it resolves outside the project",
+                    base_path.as_ref().display()
+                ),
+            );
             continue;
         }
         // Configure WalkDir to respect gitignore patterns at the directory level
@@ -62,6 +101,20 @@ pub fn collect_file_info<P: AsRef<Path>, T: Fn(&Path) -> bool>(
             !dbtignore.unwrap().matched(rel_path, true).is_ignore()
         }) {
             let entry = entry_result?;
+            if entry.file_type().is_symlink()
+                && entry.path().is_file()
+                && !std::fs::canonicalize(entry.path())
+                    .is_ok_and(|c| c.starts_with(&canonical_base))
+            {
+                emit_warn_log_message(
+                    ErrorCode::InvalidPath,
+                    format!(
+                        "Skipping '{}': it is a symlink to a file outside the project",
+                        entry.path().display()
+                    ),
+                );
+                continue;
+            }
             if entry.file_type().is_file()
                 || (entry.file_type().is_symlink() && entry.path().is_file())
             {
@@ -244,13 +297,19 @@ mod tests {
     use super::collect_file_info;
     use std::os::unix::fs::symlink;
 
+    /// A symlink to a file inside the project is collected; one whose target
+    /// is outside the project is skipped (advisory loader-resource-path-escape).
     #[test]
-    fn collect_file_info_includes_symlinked_files() {
+    fn collect_file_info_includes_symlinked_files_inside_the_project_only() {
         let temp_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
         let models_dir = temp_dir.path().join("models");
         std::fs::create_dir(&models_dir).unwrap();
         std::fs::write(models_dir.join("shared.sql"), "select 1").unwrap();
         symlink("shared.sql", models_dir.join("linked.sql")).unwrap();
+        let secret = outside_dir.path().join("secret.sql");
+        std::fs::write(&secret, "select 'secret'").unwrap();
+        symlink(&secret, models_dir.join("escaped.sql")).unwrap();
 
         let mut paths = Vec::new();
         collect_file_info(
@@ -262,11 +321,62 @@ mod tests {
         )
         .unwrap();
 
+        let collected: Vec<_> = paths.iter().map(|(p, _)| p.to_path_buf()).collect();
+        assert!(collected.contains(&models_dir.join("linked.sql")));
+        assert!(collected.contains(&models_dir.join("shared.sql")));
         assert!(
-            paths
-                .iter()
-                .any(|(path, _)| path.as_path() == models_dir.join("linked.sql"))
+            !collected.contains(&models_dir.join("escaped.sql")),
+            "{collected:?}"
         );
+    }
+
+    /// A resource path that leaves the project is refused; a directory that
+    /// is a symlink to outside the project is skipped.
+    #[test]
+    fn collect_file_info_keeps_resource_paths_inside_the_project() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let project = temp_dir.path().join("project");
+        std::fs::create_dir_all(project.join("models")).unwrap();
+        std::fs::write(project.join("models/ok.sql"), "select 1").unwrap();
+        std::fs::write(outside_dir.path().join("secret.sql"), "select 'secret'").unwrap();
+        std::fs::create_dir_all(temp_dir.path().join("sibling")).unwrap();
+        std::fs::write(temp_dir.path().join("sibling/leak.sql"), "select 'leak'").unwrap();
+        symlink(outside_dir.path(), project.join("linked_models")).unwrap();
+
+        for escape in [
+            "../sibling".to_string(),
+            "models/../../sibling".to_string(),
+            outside_dir.path().to_string_lossy().to_string(),
+        ] {
+            let mut paths = Vec::new();
+            let err = collect_file_info(
+                &project,
+                std::slice::from_ref(&escape),
+                &mut paths,
+                None,
+                |_| true,
+            )
+            .unwrap_err();
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "{escape}: {err}"
+            );
+            assert!(paths.is_empty());
+        }
+
+        let mut paths = Vec::new();
+        collect_file_info(
+            &project,
+            &["linked_models".to_string(), "models".to_string()],
+            &mut paths,
+            None,
+            |_| true,
+        )
+        .unwrap();
+        let collected: Vec<_> = paths.iter().map(|(p, _)| p.to_path_buf()).collect();
+        assert_eq!(collected, vec![project.join("models/ok.sql")]);
     }
 
     #[test]
