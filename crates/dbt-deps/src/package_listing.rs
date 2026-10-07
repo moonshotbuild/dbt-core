@@ -84,6 +84,9 @@ pub struct PackageListing<'a> {
     resolved_private_urls: HashMap<String, String>,
     /// Optional cloud-run context an implementation of [`PrivatePackageResolver`] may use.
     cloud_config: Option<ResolvedCloudConfig>,
+    /// Render entries with [`LoadContext::restricted`]: set for every listing
+    /// built from a dependency's `packages.yml`, never for the root's.
+    restricted_rendering: bool,
     notices: &'a NoticeBuffer,
 }
 
@@ -101,7 +104,23 @@ impl<'a> PackageListing<'a> {
             private_package_resolver: Arc::new(LocalPrivatePackageResolver),
             resolved_private_urls: HashMap::new(),
             cloud_config: None,
+            restricted_rendering: false,
             notices,
+        }
+    }
+
+    /// Render this listing's entries without `env_var` (a dependency's
+    /// `packages.yml`, not the root's).
+    pub fn with_restricted_rendering(mut self, restricted: bool) -> Self {
+        self.restricted_rendering = restricted;
+        self
+    }
+
+    fn load_context(&self) -> LoadContext {
+        if self.restricted_rendering {
+            LoadContext::restricted(self.vars.clone())
+        } else {
+            LoadContext::new(self.vars.clone())
         }
     }
 
@@ -176,7 +195,7 @@ impl<'a> PackageListing<'a> {
             return Ok(());
         }
 
-        let deps_context = LoadContext::new(self.vars.clone());
+        let deps_context = self.load_context();
         let mut refs = Vec::new();
         for entry in entries {
             let DbtPackageEntry::Private(p) = entry else {
@@ -212,7 +231,7 @@ impl<'a> PackageListing<'a> {
         package: DbtPackageEntry,
         jinja_env: &JinjaEnv,
     ) -> FsResult<()> {
-        let deps_context = LoadContext::new(self.vars.clone());
+        let deps_context = self.load_context();
         match package {
             DbtPackageEntry::Hub(hub_package) => {
                 let hub_package: HubPackage = {
