@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use dbt_cloud_config::ResolvedCloudConfig;
 use dbt_common::{FsResult, io_args::IoArgs};
 use dbt_schemas::schemas::packages::UpstreamProject;
-use dbt_schemas::state::DbtPackage;
+use dbt_schemas::state::{DbtPackage, DbtProfile};
 
 use crate::args::LoadArgs;
 
@@ -34,6 +34,16 @@ pub trait LoaderHooks: Send + Sync {
         _arg: &LoadArgs,
         _internal_packages_install_path: &Path,
     ) -> FsResult<()> {
+        Ok(())
+    }
+
+    /// Called once the selected profile target has been rendered and its
+    /// thread count resolved, before any adapter is built from it. An
+    /// embedder can adjust connection settings here (for example, resolve a
+    /// relative DuckDB `path` against the project directory rather than the
+    /// process working directory) so that every adapter the invocation
+    /// builds sees the same configuration.
+    fn did_load_profile(&self, _arg: &LoadArgs, _profile: &mut DbtProfile) -> FsResult<()> {
         Ok(())
     }
 }
