@@ -283,6 +283,7 @@ pub async fn load(
         iarg_mut.warn_error_options = resolved_warn_error_options.warn_error_options.clone();
     }
     let final_threads = resolve_and_set_threads(&mut dbt_profile, iarg.as_ref())?;
+    loader_hooks.did_load_profile(arg, &mut dbt_profile)?;
 
     let use_v2_compatible_package_downloads = resolve_bool_project_flag(
         arg.io.use_v2_compatible_package_downloads,
